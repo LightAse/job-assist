@@ -1,25 +1,25 @@
 from urllib.parse import urlparse
 
 from app.plugins.base import JobScraperPlugin
-from app.schemas.scrape import ScrapeCurrentRequest, ScrapeCurrentResponse
+from app.schemas.scrape import ScrapeContext, ScrapeCurrentResponse
 
 
 class LinkedInJobScraperPlugin(JobScraperPlugin):
     plugin_name = "linkedin_job_scraper"
     _supported_hosts = {"www.linkedin.com", "linkedin.com"}
 
-    def matches(self, payload: ScrapeCurrentRequest) -> bool:
-        parsed = urlparse(str(payload.url))
+    def matches(self, context: ScrapeContext) -> bool:
+        parsed = urlparse(str(context.url))
         return parsed.scheme in {"http", "https"} and parsed.netloc in self._supported_hosts and "/jobs/view/" in parsed.path
 
-    def scrape(self, payload: ScrapeCurrentRequest) -> ScrapeCurrentResponse:
+    def scrape(self, context: ScrapeContext) -> ScrapeCurrentResponse:
         return ScrapeCurrentResponse(
             plugin_name=self.plugin_name,
             matched=True,
-            source_url=payload.url,
+            source_url=context.url,
             raw_content=None,
             structured_data={
-                "external_job_id": self._extract_job_id(str(payload.url)),
+                "external_job_id": self._extract_job_id(str(context.url)),
                 "source": "linkedin",
             },
         )

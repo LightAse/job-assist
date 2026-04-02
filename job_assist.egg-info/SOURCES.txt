@@ -15,3 +15,5 @@ job_assist.egg-info/SOURCES.txt
 job_assist.egg-info/dependency_links.txt
 job_assist.egg-info/requires.txt
 job_assist.egg-info/top_level.txt
+tests/test_plugin_registry.py
+tests/test_plugins_api.py
