@@ -39,3 +39,11 @@ Thumbs.db
 dist/
 build/
 *.egg-info/
+
+
+__pycache__/
+*.pyc
+.venv/
+data/
+.env
+.pytest_cache/

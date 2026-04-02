@@ -6,6 +6,8 @@ from pydantic import BaseModel, HttpUrl
 class ScrapeContext(BaseModel):
     url: HttpUrl
     title: str | None = None
+    company: str | None = None
+    location: str | None = None
     html: str | None = None
     visible_text: str | None = None
 
