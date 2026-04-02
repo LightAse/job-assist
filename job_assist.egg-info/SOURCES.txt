@@ -1,0 +1,17 @@
+pyproject.toml
+app/__init__.py
+app/main.py
+app/api/__init__.py
+app/api/routes/__init__.py
+app/api/routes/plugins.py
+app/plugins/__init__.py
+app/plugins/base.py
+app/plugins/linkedin_job_scraper.py
+app/plugins/registry.py
+app/schemas/__init__.py
+app/schemas/scrape.py
+job_assist.egg-info/PKG-INFO
+job_assist.egg-info/SOURCES.txt
+job_assist.egg-info/dependency_links.txt
+job_assist.egg-info/requires.txt
+job_assist.egg-info/top_level.txt
