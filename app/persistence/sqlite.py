@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from app.schemas.jobs import StoredJob
 from app.schemas.scrape import ScrapeContext, ScrapeCurrentResponse
 
 
@@ -130,6 +131,59 @@ class SQLiteJobStore:
         return PersistedScrapeRecord(
             job_id=job_id,
             snapshot_id=int(snapshot_cursor.lastrowid),
+        )
+
+    def list_jobs(self) -> list[StoredJob]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    id,
+                    source,
+                    external_job_id,
+                    source_url,
+                    page_title,
+                    tentative_job_title,
+                    created_at
+                FROM jobs
+                ORDER BY created_at DESC, id DESC
+                """
+            ).fetchall()
+
+        return [self._row_to_stored_job(row) for row in rows]
+
+    def get_job(self, job_id: int) -> StoredJob | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    id,
+                    source,
+                    external_job_id,
+                    source_url,
+                    page_title,
+                    tentative_job_title,
+                    created_at
+                FROM jobs
+                WHERE id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+        return self._row_to_stored_job(row)
+
+    @staticmethod
+    def _row_to_stored_job(row: sqlite3.Row) -> StoredJob:
+        return StoredJob(
+            id=row["id"],
+            source=row["source"],
+            external_job_id=row["external_job_id"],
+            source_url=row["source_url"],
+            page_title=row["page_title"],
+            tentative_job_title=row["tentative_job_title"],
+            created_at=row["created_at"],
         )
 
 
