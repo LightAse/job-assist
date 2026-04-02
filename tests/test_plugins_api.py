@@ -23,6 +23,7 @@ def test_scrape_current_returns_linkedin_plugin_response() -> None:
         "raw_content": None,
         "structured_data": {
             "external_job_id": "1234567890",
+            "page_title": "Senior Backend Engineer",
             "source": "linkedin",
         },
     }
@@ -58,4 +59,5 @@ def test_scrape_current_accepts_html_and_visible_text_context() -> None:
     assert response.json()["structured_data"] == {
         "external_job_id": "1234567890",
         "source": "linkedin",
+        "tentative_job_title": "Senior Backend Engineer",
     }
