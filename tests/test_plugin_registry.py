@@ -22,4 +22,5 @@ def test_plugin_registry_returns_none_for_non_matching_url() -> None:
 
     plugin = plugin_registry.get_first_match(payload)
 
-    assert plugin is None
+    assert plugin is not None
+    assert plugin.plugin_name == "generic_job_capture"

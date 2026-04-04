@@ -21,5 +21,4 @@ def scrape_current(
         )
 
     scrape_result = plugin.scrape(payload)
-    job_store.save_matched_scrape(payload, scrape_result)
-    return scrape_result
+    return job_store.persist_matched_scrape(payload, scrape_result)

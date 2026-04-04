@@ -1,6 +1,7 @@
 from collections.abc import Iterable
 
 from app.plugins.base import JobScraperPlugin
+from app.plugins.generic_job_capture import GenericJobCapturePlugin
 from app.plugins.linkedin_job_scraper import LinkedInJobScraperPlugin
 from app.schemas.scrape import ScrapeContext
 
@@ -19,5 +20,6 @@ class PluginRegistry:
 plugin_registry = PluginRegistry(
     plugins=[
         LinkedInJobScraperPlugin(),
+        GenericJobCapturePlugin(),
     ]
 )

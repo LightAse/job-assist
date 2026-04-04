@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "Job Assist Capture",
+  "version": "0.1.0",
+  "description": "Capture the current tab as a potential job posting.",
+  "action": {
+    "default_title": "Job Assist Capture",
+    "default_popup": "popup.html"
+  },
+  "permissions": [
+    "activeTab",
+    "tabs",
+    "storage"
+  ],
+  "host_permissions": [
+    "<all_urls>",
+    "http://127.0.0.1:8000/*",
+    "http://localhost:8000/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content-script.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

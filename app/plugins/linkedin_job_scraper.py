@@ -15,7 +15,7 @@ class LinkedInJobScraperPlugin(JobScraperPlugin):
 
     def scrape(self, context: ScrapeContext) -> ScrapeCurrentResponse:
         structured_data = {
-            "external_job_id": self._extract_job_id(str(context.url)),
+            "external_job_id": context.linkedin_job_id or self._extract_job_id(str(context.url)),
             "source": "linkedin",
         }
         if context.title:
