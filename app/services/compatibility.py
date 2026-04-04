@@ -11,7 +11,7 @@ from app.services.compatibility_errors import (
 )
 from app.services.compatibility_models import CompatibilityEvaluation, CompatibilityStructuredOutput
 from app.services.compatibility_deterministic import DeterministicCompatibilityProvider
-from app.services.compatibility_opencode import OpenCodeCompatibilityProvider
+from app.services.compatibility_openrouter import OpenRouterCompatibilityProvider
 
 
 class CompatibilityProvider(Protocol):
@@ -31,8 +31,8 @@ def get_compatibility_service() -> CompatibilityService:
     provider_name = os.environ.get("COMPATIBILITY_PROVIDER", "deterministic").strip().lower()
     if provider_name == "deterministic":
         return CompatibilityService(provider=DeterministicCompatibilityProvider())
-    if provider_name == "opencode":
-        return CompatibilityService(provider=OpenCodeCompatibilityProvider())
+    if provider_name in {"openrouter", "opencode"}:
+        return CompatibilityService(provider=OpenRouterCompatibilityProvider())
     raise CompatibilityProviderConfigurationError(
         f"Unsupported compatibility provider: {provider_name}."
     )

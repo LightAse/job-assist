@@ -3,11 +3,19 @@ from pathlib import Path
 import pytest
 from fastapi import HTTPException
 
-from app.api.routes.jobs import delete_job, get_job, list_jobs, run_compatibility_check
+from app.api.routes.jobs import (
+    delete_job,
+    get_job,
+    list_jobs,
+    run_candidate_compatibility_check,
+    run_compatibility_check,
+    update_job_status,
+)
 from app.api.routes.resume_profiles import create_resume_profile, list_resume_profiles
 from app.persistence.sqlite import SQLiteJobStore
-from app.schemas.jobs import CreateResumeProfileRequest, RunCompatibilityCheckRequest
+from app.schemas.jobs import CreateResumeProfileRequest, RunCompatibilityCheckRequest, UpdateJobStatusRequest
 from app.schemas.scrape import ScrapeCurrentRequest, ScrapeCurrentResponse
+from app.services.compatibility_errors import CompatibilityProviderRequestError
 
 
 @pytest.fixture
@@ -58,13 +66,42 @@ def test_list_jobs_returns_newest_first(temp_job_store: SQLiteJobStore) -> None:
         temp_job_store,
         job_id="9876543210",
         title="Senior Backend Engineer",
+        company="Example Co",
     )
 
     jobs = list_jobs(job_store=temp_job_store)
 
     assert [job.id for job in jobs] == [newer_job_id, older_job_id]
     assert jobs[0].external_job_id == "9876543210"
+    assert jobs[0].latest_snapshot is not None
+    assert jobs[0].latest_snapshot.title == "Senior Backend Engineer"
+    assert jobs[0].latest_snapshot.company == "Example Co"
+    assert jobs[0].status == "new"
     assert jobs[1].external_job_id == "1234567890"
+    assert jobs[1].status == "new"
+
+
+def test_update_job_status_persists_and_is_returned_by_list_and_detail(temp_job_store: SQLiteJobStore) -> None:
+    job_id = _save_job(
+        temp_job_store,
+        job_id="1234567890",
+        title="Backend Engineer",
+        company="Example Co",
+    )
+
+    updated_job = update_job_status(
+        job_id=job_id,
+        payload=UpdateJobStatusRequest(status="in_progress"),
+        job_store=temp_job_store,
+    )
+
+    assert updated_job.status == "in_progress"
+
+    job = get_job(job_id=job_id, job_store=temp_job_store)
+    jobs = list_jobs(job_store=temp_job_store)
+
+    assert job.status == "in_progress"
+    assert jobs[0].status == "in_progress"
 
 
 def test_get_job_returns_latest_snapshot_and_latest_check(temp_job_store: SQLiteJobStore) -> None:
@@ -104,6 +141,79 @@ def test_get_job_returns_latest_snapshot_and_latest_check(temp_job_store: SQLite
     assert job.latest_compatibility_check.id == check_response.compatibility_check.id
     assert job.latest_compatibility_check.resume_profile_id == resume_profile.id
     assert job.latest_compatibility_check.score >= 0
+
+
+def test_run_candidate_compatibility_check_persists_result(temp_job_store: SQLiteJobStore, monkeypatch: pytest.MonkeyPatch) -> None:
+    job_id = _save_job(
+        temp_job_store,
+        job_id="1234567890",
+        title="Senior Backend Engineer",
+        company="Example Co",
+        location="Remote",
+        visible_text="Senior Backend Engineer at Example Co\nPython FastAPI Postgres Remote",
+    )
+    temp_job_store.update_candidate_profile(type("Payload", (), {"summary": "Backend engineer with Python and FastAPI experience."})())
+
+    class FakeService:
+        def evaluate(self, *, job, job_store):
+            return type(
+                "Result",
+                (),
+                {
+                    "score": 82,
+                    "short_reason": "Strong backend overlap with some infrastructure gaps.",
+                    "strengths": ["Python", "FastAPI"],
+                    "gaps": ["AWS"],
+                    "raw_model_response": '{"score":82}',
+                },
+            )()
+
+    monkeypatch.setattr("app.api.routes.jobs.get_candidate_compatibility_service", lambda: FakeService())
+
+    response = run_candidate_compatibility_check(job_id=job_id, job_store=temp_job_store)
+
+    assert response.job_id == job_id
+    assert response.compatibility_check.score == 82
+    assert response.compatibility_check.short_reason
+
+    job = get_job(job_id=job_id, job_store=temp_job_store)
+    assert job.latest_candidate_compatibility_check is not None
+    assert job.latest_candidate_compatibility_check.score == 82
+
+    jobs = list_jobs(job_store=temp_job_store)
+    assert jobs[0].latest_candidate_compatibility_check is not None
+    assert jobs[0].latest_candidate_compatibility_check.score == 82
+
+
+def test_run_candidate_compatibility_check_maps_openrouter_privacy_error_to_clear_message(
+    temp_job_store: SQLiteJobStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_id = _save_job(
+        temp_job_store,
+        job_id="1234567890",
+        title="Senior Backend Engineer",
+        company="Example Co",
+        location="Remote",
+        visible_text="Senior Backend Engineer at Example Co\nPython FastAPI Postgres Remote",
+    )
+
+    class FakeService:
+        def evaluate(self, *, job, job_store):
+            raise CompatibilityProviderRequestError(
+                "No endpoints available matching your guardrail restrictions and data policy"
+            )
+
+    monkeypatch.setattr("app.api.routes.jobs.get_candidate_compatibility_service", lambda: FakeService())
+
+    with pytest.raises(HTTPException) as error:
+        run_candidate_compatibility_check(job_id=job_id, job_store=temp_job_store)
+
+    assert error.value.status_code == 502
+    assert error.value.detail == (
+        "The selected OpenRouter model is unavailable under your current Privacy/Data Policy settings. "
+        "Check OpenRouter Settings -> Privacy or choose another model."
+    )
 
 
 def test_run_compatibility_check_persists_result(temp_job_store: SQLiteJobStore) -> None:

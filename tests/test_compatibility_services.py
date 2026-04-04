@@ -6,7 +6,13 @@ from fastapi import HTTPException
 from app.api.routes.jobs import run_compatibility_check
 from app.api.routes.resume_profiles import create_resume_profile
 from app.persistence.sqlite import SQLiteJobStore
-from app.schemas.jobs import CreateResumeProfileRequest, LatestJobSnapshot, ResumeProfile, RunCompatibilityCheckRequest
+from app.schemas.jobs import (
+    CreateResumeProfileRequest,
+    LatestJobSnapshot,
+    ResumeProfile,
+    RunCompatibilityCheckRequest,
+    UpdateOpenRouterSettingsRequest,
+)
 from app.schemas.scrape import ScrapeCurrentRequest, ScrapeCurrentResponse
 from app.services.compatibility import CompatibilityService, get_compatibility_service
 from app.services.compatibility_deterministic import DeterministicCompatibilityProvider
@@ -15,7 +21,7 @@ from app.services.compatibility_errors import (
     CompatibilityProviderRequestError,
     CompatibilityProviderTimeoutError,
 )
-from app.services.compatibility_opencode import OpenCodeCompatibilityProvider
+from app.services.compatibility_openrouter import OpenRouterCompatibilityProvider
 
 
 def _snapshot() -> LatestJobSnapshot:
@@ -35,8 +41,11 @@ def _resume_profile() -> ResumeProfile:
     return ResumeProfile(
         id=7,
         name="Backend Resume",
+        headline=None,
+        summary=None,
         content="Senior backend engineer with Python FastAPI Postgres experience in remote teams.",
         created_at="2026-04-02T00:00:00+00:00",
+        updated_at="2026-04-02T00:00:00+00:00",
     )
 
 
@@ -85,12 +94,29 @@ def test_provider_selection_defaults_to_deterministic(monkeypatch: pytest.Monkey
     assert isinstance(service.provider, DeterministicCompatibilityProvider)
 
 
-def test_provider_selection_supports_opencode(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("COMPATIBILITY_PROVIDER", "opencode")
+def test_provider_selection_supports_openrouter(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("COMPATIBILITY_PROVIDER", "openrouter")
 
     service = get_compatibility_service()
 
-    assert isinstance(service.provider, OpenCodeCompatibilityProvider)
+    assert isinstance(service.provider, OpenRouterCompatibilityProvider)
+
+
+def test_openrouter_provider_uses_saved_local_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("JOB_ASSIST_DB_PATH", str(tmp_path / "provider_settings.db"))
+    store = SQLiteJobStore(tmp_path / "provider_settings.db")
+    store.update_openrouter_settings(
+        UpdateOpenRouterSettingsRequest(
+            api_key="saved-local-key-9999",
+            provider="openrouter",
+            default_model="minimax/minimax-m2.5:free",
+        )
+    )
+
+    provider = OpenRouterCompatibilityProvider(base_url="http://openrouter.test", timeout_seconds=1)
+
+    assert provider.auth_token == "saved-local-key-9999"
+    assert provider.model == "minimax/minimax-m2.5:free"
 
 
 def test_provider_selection_rejects_unknown_provider(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -100,11 +126,10 @@ def test_provider_selection_rejects_unknown_provider(monkeypatch: pytest.MonkeyP
         get_compatibility_service()
 
 
-def test_opencode_response_is_normalized_from_text_json(monkeypatch: pytest.MonkeyPatch) -> None:
-    provider = OpenCodeCompatibilityProvider(base_url="http://opencode.test", timeout_seconds=1)
+def test_openrouter_response_is_normalized_from_text_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = OpenRouterCompatibilityProvider(base_url="http://openrouter.test", timeout_seconds=1)
     responses = iter(
         [
-            {"id": "session-123"},
             {
                 "parts": [
                     {
@@ -119,7 +144,7 @@ def test_opencode_response_is_normalized_from_text_json(monkeypatch: pytest.Monk
     )
 
     monkeypatch.setattr(
-        OpenCodeCompatibilityProvider,
+        OpenRouterCompatibilityProvider,
         "_post_json",
         lambda self, path, payload: next(responses),
     )
@@ -138,8 +163,70 @@ def test_opencode_response_is_normalized_from_text_json(monkeypatch: pytest.Monk
     assert '\\"score\\": 82' in evaluation.raw_model_response
 
 
-def test_opencode_provider_prefers_visible_text_and_truncates_payload() -> None:
-    provider = OpenCodeCompatibilityProvider(base_url="http://opencode.test", timeout_seconds=1)
+def test_openrouter_provider_defaults_to_real_https_api(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("JOB_ASSIST_DB_PATH", str(tmp_path / "provider_defaults.db"))
+    store = SQLiteJobStore(tmp_path / "provider_defaults.db")
+    store.update_openrouter_settings(
+        UpdateOpenRouterSettingsRequest(
+            api_key="saved-local-key-9999",
+            provider="openrouter",
+            default_model="minimax/minimax-m2.5:free",
+        )
+    )
+
+    provider = OpenRouterCompatibilityProvider(timeout_seconds=1)
+
+    assert provider.base_url == "https://openrouter.ai/api/v1"
+
+
+def test_openrouter_provider_rejects_localhost_base_url(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("JOB_ASSIST_DB_PATH", str(tmp_path / "provider_localhost.db"))
+    store = SQLiteJobStore(tmp_path / "provider_localhost.db")
+    store.update_openrouter_settings(
+        UpdateOpenRouterSettingsRequest(
+            api_key="saved-local-key-9999",
+            provider="openrouter",
+            default_model="minimax/minimax-m2.5:free",
+        )
+    )
+
+    with pytest.raises(CompatibilityProviderConfigurationError) as error:
+        OpenRouterCompatibilityProvider(base_url="http://127.0.0.1:4096", timeout_seconds=1)
+
+    assert "local host" in str(error.value)
+
+
+def test_valid_selected_model_id_is_passed_to_openrouter_payload() -> None:
+    provider = OpenRouterCompatibilityProvider(
+        base_url="https://openrouter.ai/api/v1",
+        timeout_seconds=1,
+        auth_token="saved-local-key-9999",
+        model="qwen/qwen3.6-plus:free",
+        provider_name="openrouter",
+    )
+
+    payload = provider._build_chat_completions_payload(
+        provider._build_message_payload(resume_profile=_resume_profile(), snapshot=_snapshot())
+    )
+
+    assert payload["model"] == "qwen/qwen3.6-plus:free"
+
+
+def test_invalid_prefixed_model_id_is_rejected_before_request() -> None:
+    with pytest.raises(CompatibilityProviderConfigurationError) as error:
+        OpenRouterCompatibilityProvider(
+            base_url="https://openrouter.ai/api/v1",
+            timeout_seconds=1,
+            auth_token="saved-local-key-9999",
+            model="openrouter/qwen3.6-plus-free",
+            provider_name="openrouter",
+        )
+
+    assert "model id is invalid" in str(error.value)
+
+
+def test_openrouter_provider_prefers_visible_text_and_truncates_payload() -> None:
+    provider = OpenRouterCompatibilityProvider(base_url="http://openrouter.test", timeout_seconds=1)
     snapshot = LatestJobSnapshot(
         id=1,
         title="Senior Backend Engineer",
@@ -205,7 +292,7 @@ def test_provider_request_failure_maps_to_bad_gateway(monkeypatch: pytest.Monkey
 
     class FailingService:
         def evaluate(self, *, resume_profile: ResumeProfile, snapshot: LatestJobSnapshot):
-            raise CompatibilityProviderRequestError("OpenCode request failed: connection refused")
+            raise CompatibilityProviderRequestError("OpenRouter request failed: connection refused")
 
     monkeypatch.setattr("app.api.routes.jobs.get_compatibility_service", lambda: FailingService())
 
@@ -217,4 +304,4 @@ def test_provider_request_failure_maps_to_bad_gateway(monkeypatch: pytest.Monkey
         )
 
     assert error.value.status_code == 502
-    assert "OpenCode request failed" in error.value.detail
+    assert "OpenRouter request failed" in error.value.detail

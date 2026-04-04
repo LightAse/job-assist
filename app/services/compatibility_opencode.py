@@ -1,11 +1,14 @@
 import json
+import logging
 import os
 from dataclasses import dataclass
 from socket import timeout as SocketTimeout
 from urllib import error, request
+from urllib.parse import urlparse
 
 from pydantic import ValidationError
 
+from app.persistence.sqlite import SQLiteJobStore
 from app.schemas.jobs import LatestJobSnapshot, ResumeProfile
 from app.services.compatibility_errors import (
     CompatibilityProviderConfigurationError,
@@ -16,27 +19,41 @@ from app.services.compatibility_errors import (
 from app.services.compatibility_models import CompatibilityEvaluation, CompatibilityStructuredOutput
 
 
+logger = logging.getLogger(__name__)
+
+
 @dataclass(frozen=True)
-class OpenCodeCompatibilityProvider:
+class OpenRouterCompatibilityProvider:
     base_url: str | None = None
     model: str | None = None
     timeout_seconds: float | None = None
     auth_token: str | None = None
+    provider_name: str | None = None
 
     _prompt_visible_text_limit = 12_000
     _prompt_html_limit = 4_000
     _resume_limit = 12_000
 
     def __post_init__(self) -> None:
+        runtime_api_key, runtime_provider, runtime_model = SQLiteJobStore().get_openrouter_runtime_config()
         if self.base_url is None:
-            object.__setattr__(self, "base_url", os.environ.get("OPENCODE_BASE_URL", "http://127.0.0.1:4096"))
+            object.__setattr__(
+                self,
+                "base_url",
+                os.environ.get("OPENROUTER_BASE_URL")
+                or "https://openrouter.ai/api/v1",
+            )
         if self.model is None:
-            object.__setattr__(self, "model", os.environ.get("OPENCODE_MODEL"))
+            object.__setattr__(self, "model", runtime_model)
         if self.timeout_seconds is None:
-            configured_timeout = os.environ.get("OPENCODE_TIMEOUT_SECONDS", "20")
+            configured_timeout = os.environ.get("OPENROUTER_TIMEOUT_SECONDS") or os.environ.get("OPENCODE_TIMEOUT_SECONDS", "20")
             object.__setattr__(self, "timeout_seconds", float(configured_timeout))
         if self.auth_token is None:
-            object.__setattr__(self, "auth_token", os.environ.get("OPENCODE_AUTH_TOKEN"))
+            object.__setattr__(self, "auth_token", runtime_api_key)
+        if self.provider_name is None:
+            object.__setattr__(self, "provider_name", runtime_provider or "openrouter")
+
+        self._validate_runtime_config()
 
     def evaluate(self, *, resume_profile: ResumeProfile, snapshot: LatestJobSnapshot) -> CompatibilityEvaluation:
         session_id = self._create_session()
@@ -54,11 +71,7 @@ class OpenCodeCompatibilityProvider:
         )
 
     def _create_session(self) -> str:
-        response_body = self._post_json("/session", {})
-        session_id = response_body.get("id")
-        if not session_id:
-            raise CompatibilityProviderResponseError("OpenCode did not return a session id.")
-        return str(session_id)
+        return "openrouter-chat"
 
     def _build_message_payload(
         self,
@@ -128,12 +141,21 @@ class OpenCodeCompatibilityProvider:
         return value[:limit].rstrip() + "\n...[truncated]"
 
     def _post_json(self, path: str, payload: dict[str, object]) -> dict[str, object]:
-        if not self.base_url:
-            raise CompatibilityProviderConfigurationError("OPENCODE_BASE_URL is not configured.")
+        self._validate_runtime_config()
 
-        body = json.dumps(payload).encode("utf-8")
+        if path == "/session":
+            return {"id": "openrouter-chat"}
+
+        if not path.startswith("/session/") or not path.endswith("/message"):
+            raise CompatibilityProviderConfigurationError(f"Unsupported OpenRouter request path: {path}")
+
+        url = f"{self.base_url.rstrip('/')}/chat/completions"
+        request_payload = self._build_chat_completions_payload(payload)
+        self._log_request_config(url=url, payload=request_payload)
+
+        body = json.dumps(request_payload).encode("utf-8")
         http_request = request.Request(
-            f"{self.base_url.rstrip('/')}{path}",
+            url,
             data=body,
             headers=self._headers(),
             method="POST",
@@ -144,26 +166,150 @@ class OpenCodeCompatibilityProvider:
         except error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="ignore")
             raise CompatibilityProviderRequestError(
-                f"OpenCode request failed with status {exc.code}: {detail or exc.reason}"
+                f"OpenRouter request failed for {url} with status {exc.code}: {detail or exc.reason}"
             ) from exc
         except error.URLError as exc:
             reason = exc.reason
             if isinstance(reason, SocketTimeout):
-                raise CompatibilityProviderTimeoutError("OpenCode request timed out.") from exc
-            raise CompatibilityProviderRequestError(f"OpenCode request failed: {reason}") from exc
+                raise CompatibilityProviderTimeoutError("OpenRouter request timed out.") from exc
+            raise CompatibilityProviderRequestError(f"OpenRouter request failed for {url}: {reason}") from exc
         except TimeoutError as exc:
-            raise CompatibilityProviderTimeoutError("OpenCode request timed out.") from exc
+            raise CompatibilityProviderTimeoutError("OpenRouter request timed out.") from exc
 
         try:
-            return json.loads(response_body)
+            parsed_response = json.loads(response_body)
         except json.JSONDecodeError as exc:
-            raise CompatibilityProviderResponseError("OpenCode returned non-JSON response data.") from exc
+            raise CompatibilityProviderResponseError("OpenRouter returned non-JSON response data.") from exc
+
+        return self._normalize_chat_response(parsed_response)
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
         if self.auth_token:
             headers["Authorization"] = f"Bearer {self.auth_token}"
         return headers
+
+    def _validate_runtime_config(self) -> None:
+        if (self.provider_name or "").strip().lower() not in {"", "openrouter"}:
+            raise CompatibilityProviderConfigurationError(
+                f"OpenRouter provider is misconfigured: expected provider 'openrouter', got '{self.provider_name}'."
+            )
+        if not self.base_url:
+            raise CompatibilityProviderConfigurationError("OpenRouter base URL is not configured.")
+        parsed = urlparse(self.base_url)
+        host = (parsed.hostname or "").lower()
+        if not parsed.scheme or not parsed.netloc:
+            raise CompatibilityProviderConfigurationError(
+                f"OpenRouter base URL is invalid: {self.base_url!r}."
+            )
+        if host in {"localhost", "127.0.0.1", "::1"}:
+            raise CompatibilityProviderConfigurationError(
+                "OpenRouter base URL points to a local host. Configure the real OpenRouter API endpoint instead."
+            )
+        if "/session" in parsed.path:
+            raise CompatibilityProviderConfigurationError(
+                "OpenRouter base URL is using a stale session-style endpoint. Configure the API base URL, for example https://openrouter.ai/api/v1."
+            )
+        if not self.auth_token:
+            raise CompatibilityProviderConfigurationError("OpenRouter API key is not configured.")
+        if not self.model:
+            raise CompatibilityProviderConfigurationError("OpenRouter model is not configured.")
+        if not self._is_valid_openrouter_model_id(self.model):
+            raise CompatibilityProviderConfigurationError(
+                f"OpenRouter model id is invalid: {self.model!r}. Use the real API model id, for example qwen/qwen3.6-plus:free."
+            )
+
+    def _build_chat_completions_payload(self, payload: dict[str, object]) -> dict[str, object]:
+        message_text = self._extract_prompt_text(payload)
+        request_payload: dict[str, object] = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": str(payload.get("system") or "You are a helpful assistant.")},
+                {"role": "user", "content": message_text},
+            ],
+        }
+        format_block = payload.get("format")
+        if isinstance(format_block, dict) and format_block.get("type") == "json_schema":
+            request_payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": format_block.get("name") or "response",
+                    "strict": True,
+                    "schema": format_block.get("schema") or {},
+                },
+            }
+        return request_payload
+
+    @staticmethod
+    def _extract_prompt_text(payload: dict[str, object]) -> str:
+        parts = payload.get("parts", [])
+        if isinstance(parts, list):
+            for part in parts:
+                if isinstance(part, dict) and isinstance(part.get("text"), str) and part["text"].strip():
+                    return part["text"]
+        raise CompatibilityProviderConfigurationError("OpenRouter request payload did not include a text prompt.")
+
+    @staticmethod
+    def _is_valid_openrouter_model_id(model_id: str) -> bool:
+        normalized = model_id.strip()
+        if not normalized or " " in normalized:
+            return False
+        if normalized == "openrouter/auto":
+            return True
+        if normalized.startswith("openrouter/"):
+            return False
+        return "/" in normalized
+
+    def _log_request_config(self, *, url: str, payload: dict[str, object]) -> None:
+        logger.info(
+            "OpenRouter request config: provider=%s model=%s base_url=%s url=%s api_key_present=%s",
+            self.provider_name,
+            self.model,
+            self.base_url,
+            url,
+            bool(self.auth_token),
+        )
+        logger.debug("OpenRouter request payload keys: %s", sorted(payload.keys()))
+
+    @staticmethod
+    def _normalize_chat_response(response_body: dict[str, object]) -> dict[str, object]:
+        text = OpenRouterCompatibilityProvider._extract_chat_text(response_body)
+        return {
+            "text": text,
+            "output": text,
+            "content": text,
+            "parts": [{"text": text}],
+            "raw_response": response_body,
+        }
+
+    @staticmethod
+    def _extract_chat_text(response_body: dict[str, object]) -> str:
+        choices = response_body.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise CompatibilityProviderResponseError("OpenRouter response did not include choices.")
+
+        first_choice = choices[0]
+        if not isinstance(first_choice, dict):
+            raise CompatibilityProviderResponseError("OpenRouter response choice was malformed.")
+
+        message = first_choice.get("message")
+        if not isinstance(message, dict):
+            raise CompatibilityProviderResponseError("OpenRouter response did not include a message.")
+
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+            normalized = "\n".join(part.strip() for part in parts if part.strip()).strip()
+            if normalized:
+                return normalized
+
+        raise CompatibilityProviderResponseError("OpenRouter response did not contain text content.")
 
     @classmethod
     def _extract_structured_output(cls, response_body: dict[str, object]) -> CompatibilityStructuredOutput:
@@ -186,7 +332,7 @@ class OpenCodeCompatibilityProvider:
             except ValidationError:
                 continue
 
-        raise CompatibilityProviderResponseError("OpenCode response did not contain valid structured compatibility output.")
+        raise CompatibilityProviderResponseError("OpenRouter response did not contain valid structured compatibility output.")
 
     @staticmethod
     def _nested_get(payload: dict[str, object], *keys: str) -> object:
@@ -228,3 +374,6 @@ class OpenCodeCompatibilityProvider:
             if isinstance(parsed, dict):
                 return parsed
         return None
+
+
+OpenCodeCompatibilityProvider = OpenRouterCompatibilityProvider
