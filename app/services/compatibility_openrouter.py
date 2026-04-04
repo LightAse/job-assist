@@ -1,0 +1,1 @@
+from app.services.compatibility_opencode import OpenRouterCompatibilityProvider
