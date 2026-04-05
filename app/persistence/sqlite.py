@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -18,6 +19,7 @@ from app.schemas.jobs import (
     CreateMasterProjectRequest,
     CreateMasterSkillRequest,
     CreateMasterWorkExperienceRequest,
+    GeneratedCvArtifact,
     JobDetail,
     JobCheckBatchItem,
     JobCheckBatchRun,
@@ -102,6 +104,12 @@ class SQLiteJobStore:
     def database_path(self) -> Path:
         return self._database_path
 
+    @property
+    def generated_cvs_directory(self) -> Path:
+        directory = self._database_path.parent / "generated_cvs"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self._database_path)
@@ -156,6 +164,13 @@ class SQLiteJobStore:
 
                 CREATE TABLE IF NOT EXISTS candidate_profile (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
+                    full_name TEXT,
+                    email TEXT,
+                    phone TEXT,
+                    location TEXT,
+                    linkedin_url TEXT,
+                    github_url TEXT,
+                    portfolio_url TEXT,
                     summary TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -358,6 +373,22 @@ class SQLiteJobStore:
                     FOREIGN KEY (snapshot_id) REFERENCES job_snapshots (id)
                 );
 
+                CREATE TABLE IF NOT EXISTS generated_cvs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id INTEGER NOT NULL,
+                    company TEXT,
+                    job_title TEXT,
+                    filename TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    file_format TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    skills_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (job_id) REFERENCES jobs (id)
+                );
+
                 CREATE TABLE IF NOT EXISTS job_check_batches (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     mode TEXT NOT NULL,
@@ -400,6 +431,13 @@ class SQLiteJobStore:
             self._ensure_column(connection, "resume_profiles", "headline", "TEXT")
             self._ensure_column(connection, "resume_profiles", "summary", "TEXT")
             self._ensure_column(connection, "resume_profiles", "updated_at", "TEXT")
+            self._ensure_column(connection, "candidate_profile", "full_name", "TEXT")
+            self._ensure_column(connection, "candidate_profile", "email", "TEXT")
+            self._ensure_column(connection, "candidate_profile", "phone", "TEXT")
+            self._ensure_column(connection, "candidate_profile", "location", "TEXT")
+            self._ensure_column(connection, "candidate_profile", "linkedin_url", "TEXT")
+            self._ensure_column(connection, "candidate_profile", "github_url", "TEXT")
+            self._ensure_column(connection, "candidate_profile", "portfolio_url", "TEXT")
             self._ensure_column(connection, "opencode_settings", "provider", "TEXT")
             connection.execute(
                 """
@@ -418,8 +456,20 @@ class SQLiteJobStore:
             now = _utc_now_iso()
             connection.execute(
                 """
-                INSERT INTO candidate_profile (id, summary, created_at, updated_at)
-                SELECT 1, NULL, ?, ?
+                INSERT INTO candidate_profile (
+                    id,
+                    full_name,
+                    email,
+                    phone,
+                    location,
+                    linkedin_url,
+                    github_url,
+                    portfolio_url,
+                    summary,
+                    created_at,
+                    updated_at
+                )
+                SELECT 1, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?
                 WHERE NOT EXISTS (SELECT 1 FROM candidate_profile WHERE id = 1)
                 """,
                 (now, now),
@@ -671,12 +721,22 @@ class SQLiteJobStore:
                 """,
                 (job_id,),
             ).fetchone()
+            generated_cv_rows = connection.execute(
+                """
+                SELECT id, job_id, company, job_title, filename, file_path, file_format, summary, skills_json, created_at, updated_at
+                FROM generated_cvs
+                WHERE job_id = ?
+                ORDER BY updated_at DESC, id DESC
+                """,
+                (job_id,),
+            ).fetchall()
 
         return JobDetail(
             **self._row_to_stored_job(job_row).model_dump(),
             latest_snapshot=self._row_to_latest_snapshot(snapshot_row) if snapshot_row else None,
             latest_compatibility_check=self._row_to_compatibility_check(compatibility_row) if compatibility_row else None,
             latest_candidate_compatibility_check=self._row_to_candidate_compatibility_check(candidate_compatibility_row) if candidate_compatibility_row else None,
+            generated_cvs=[self._row_to_generated_cv_artifact(row) for row in generated_cv_rows],
         )
 
     def update_job_status(self, job_id: int, status_value: str) -> StoredJob | None:
@@ -905,7 +965,18 @@ class SQLiteJobStore:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT id, summary, created_at, updated_at
+                SELECT
+                    id,
+                    full_name,
+                    email,
+                    phone,
+                    location,
+                    linkedin_url,
+                    github_url,
+                    portfolio_url,
+                    summary,
+                    created_at,
+                    updated_at
                 FROM candidate_profile
                 WHERE id = 1
                 """
@@ -914,23 +985,187 @@ class SQLiteJobStore:
 
     def update_candidate_profile(self, payload: UpdateCandidateProfileRequest) -> CandidateProfile:
         timestamp = _utc_now_iso()
+        provided_fields = payload.model_dump(exclude_unset=True)
         with self._connect() as connection:
+            existing_row = connection.execute(
+                """
+                SELECT
+                    id,
+                    full_name,
+                    email,
+                    phone,
+                    location,
+                    linkedin_url,
+                    github_url,
+                    portfolio_url,
+                    summary,
+                    created_at,
+                    updated_at
+                FROM candidate_profile
+                WHERE id = 1
+                """
+            ).fetchone()
+            existing_profile = self._row_to_candidate_profile(existing_row)
             connection.execute(
                 """
                 UPDATE candidate_profile
-                SET summary = ?, updated_at = ?
+                SET
+                    full_name = ?,
+                    email = ?,
+                    phone = ?,
+                    location = ?,
+                    linkedin_url = ?,
+                    github_url = ?,
+                    portfolio_url = ?,
+                    summary = ?,
+                    updated_at = ?
                 WHERE id = 1
                 """,
-                (payload.summary, timestamp),
+                (
+                    provided_fields.get("full_name", existing_profile.full_name),
+                    provided_fields.get("email", existing_profile.email),
+                    provided_fields.get("phone", existing_profile.phone),
+                    provided_fields.get("location", existing_profile.location),
+                    provided_fields.get("linkedin_url", existing_profile.linkedin_url),
+                    provided_fields.get("github_url", existing_profile.github_url),
+                    provided_fields.get("portfolio_url", existing_profile.portfolio_url),
+                    provided_fields.get("summary", existing_profile.summary),
+                    timestamp,
+                ),
             )
             row = connection.execute(
                 """
-                SELECT id, summary, created_at, updated_at
+                SELECT
+                    id,
+                    full_name,
+                    email,
+                    phone,
+                    location,
+                    linkedin_url,
+                    github_url,
+                    portfolio_url,
+                    summary,
+                    created_at,
+                    updated_at
                 FROM candidate_profile
                 WHERE id = 1
                 """
             ).fetchone()
         return self._row_to_candidate_profile(row)
+
+    def get_generated_cv_artifact(self, artifact_id: int) -> GeneratedCvArtifact | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, job_id, company, job_title, filename, file_path, file_format, summary, skills_json, created_at, updated_at
+                FROM generated_cvs
+                WHERE id = ?
+                """,
+                (artifact_id,),
+            ).fetchone()
+        return self._row_to_generated_cv_artifact(row) if row else None
+
+    def save_generated_cv_artifact(
+        self,
+        *,
+        job_id: int,
+        company: str | None,
+        job_title: str | None,
+        summary: str,
+        skills: list[str],
+        content: str,
+    ) -> GeneratedCvArtifact:
+        timestamp = _utc_now_iso()
+        filename = self._build_generated_cv_filename(job_id=job_id, company=company, job_title=job_title)
+        file_path = self.generated_cvs_directory / filename
+        file_path.write_text(content, encoding="utf-8")
+
+        with self._connect() as connection:
+            existing = connection.execute(
+                """
+                SELECT id
+                FROM generated_cvs
+                WHERE job_id = ?
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 1
+                """,
+                (job_id,),
+            ).fetchone()
+            if existing is None:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO generated_cvs (
+                        job_id,
+                        company,
+                        job_title,
+                        filename,
+                        file_path,
+                        file_format,
+                        content,
+                        summary,
+                        skills_json,
+                        created_at,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        job_id,
+                        company,
+                        job_title,
+                        filename,
+                        str(file_path),
+                        "md",
+                        content,
+                        summary,
+                        json.dumps(skills),
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                artifact_id = int(cursor.lastrowid)
+            else:
+                artifact_id = int(existing["id"])
+                connection.execute(
+                    """
+                    UPDATE generated_cvs
+                    SET company = ?, job_title = ?, filename = ?, file_path = ?, file_format = ?, content = ?, summary = ?, skills_json = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        company,
+                        job_title,
+                        filename,
+                        str(file_path),
+                        "md",
+                        content,
+                        summary,
+                        json.dumps(skills),
+                        timestamp,
+                        artifact_id,
+                    ),
+                )
+            row = connection.execute(
+                """
+                SELECT id, job_id, company, job_title, filename, file_path, file_format, summary, skills_json, created_at, updated_at
+                FROM generated_cvs
+                WHERE id = ?
+                """,
+                (artifact_id,),
+            ).fetchone()
+        assert row is not None
+        return self._row_to_generated_cv_artifact(row)
+
+    def get_generated_cv_content(self, artifact_id: int) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT content
+                FROM generated_cvs
+                WHERE id = ?
+                """,
+                (artifact_id,),
+            ).fetchone()
+        return str(row["content"]) if row is not None else None
 
     def get_openrouter_settings(self) -> OpenRouterSettings:
         with self._connect() as connection:
@@ -2249,6 +2484,24 @@ class SQLiteJobStore:
             self._row_to_master_language,
         )
 
+    def _build_generated_cv_filename(
+        self,
+        *,
+        job_id: int,
+        company: str | None,
+        job_title: str | None,
+    ) -> str:
+        candidate_profile = self.get_candidate_profile()
+        name_token = self._sanitize_filename_part(candidate_profile.full_name or "candidate")
+        company_token = self._sanitize_filename_part(company or "company")
+        return f"{name_token}_cv_{company_token}_{job_id}.md"
+
+    @staticmethod
+    def _sanitize_filename_part(value: str) -> str:
+        normalized = re.sub(r"[^a-z0-9]+", "_", value.strip().lower())
+        normalized = re.sub(r"_+", "_", normalized).strip("_")
+        return normalized or "item"
+
     @staticmethod
     def _format_date_range(start_date: str | None, end_date: str | None) -> str | None:
         if start_date and end_date:
@@ -2584,6 +2837,14 @@ class SQLiteJobStore:
             ).fetchone()
             if existing_job is None:
                 return False
+            artifact_rows = connection.execute(
+                """
+                SELECT file_path
+                FROM generated_cvs
+                WHERE job_id = ?
+                """,
+                (job_id,),
+            ).fetchall()
 
             connection.execute(
                 "DELETE FROM compatibility_checks WHERE job_id = ?",
@@ -2594,6 +2855,10 @@ class SQLiteJobStore:
                 (job_id,),
             )
             connection.execute(
+                "DELETE FROM generated_cvs WHERE job_id = ?",
+                (job_id,),
+            )
+            connection.execute(
                 "DELETE FROM job_snapshots WHERE job_id = ?",
                 (job_id,),
             )
@@ -2601,6 +2866,11 @@ class SQLiteJobStore:
                 "DELETE FROM jobs WHERE id = ?",
                 (job_id,),
             )
+
+        for artifact_row in artifact_rows:
+            file_path = artifact_row["file_path"]
+            if file_path:
+                Path(file_path).unlink(missing_ok=True)
 
         return True
 
@@ -2827,7 +3097,30 @@ class SQLiteJobStore:
     def _row_to_candidate_profile(row: sqlite3.Row) -> CandidateProfile:
         return CandidateProfile(
             id=row["id"],
+            full_name=row["full_name"],
+            email=row["email"],
+            phone=row["phone"],
+            location=row["location"],
+            linkedin_url=row["linkedin_url"],
+            github_url=row["github_url"],
+            portfolio_url=row["portfolio_url"],
             summary=row["summary"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _row_to_generated_cv_artifact(row: sqlite3.Row) -> GeneratedCvArtifact:
+        return GeneratedCvArtifact(
+            id=row["id"],
+            job_id=row["job_id"],
+            company=row["company"],
+            job_title=row["job_title"],
+            filename=row["filename"],
+            file_path=row["file_path"],
+            file_format=row["file_format"],
+            summary=row["summary"],
+            skills=json.loads(row["skills_json"]),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )

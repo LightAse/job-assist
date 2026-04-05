@@ -50,6 +50,20 @@ class CandidateCompatibilityCheckResult(BaseModel):
     created_at: str
 
 
+class GeneratedCvArtifact(BaseModel):
+    id: int
+    job_id: int
+    company: str | None
+    job_title: str | None
+    filename: str
+    file_path: str
+    file_format: str
+    summary: str
+    skills: list[str]
+    created_at: str
+    updated_at: str
+
+
 class JobListItem(StoredJob):
     latest_snapshot: LatestJobSnapshot | None = None
     latest_candidate_compatibility_check: CandidateCompatibilityCheckResult | None = None
@@ -59,6 +73,7 @@ class JobDetail(StoredJob):
     latest_snapshot: LatestJobSnapshot | None
     latest_compatibility_check: CompatibilityCheckResult | None
     latest_candidate_compatibility_check: CandidateCompatibilityCheckResult | None
+    generated_cvs: list[GeneratedCvArtifact] = Field(default_factory=list)
 
 
 class MasterSkill(BaseModel):
@@ -136,6 +151,13 @@ class MasterLink(BaseModel):
 
 class CandidateProfile(BaseModel):
     id: int
+    full_name: str | None
+    email: str | None
+    phone: str | None
+    location: str | None
+    linkedin_url: str | None
+    github_url: str | None
+    portfolio_url: str | None
     summary: str | None
     created_at: str
     updated_at: str
@@ -359,7 +381,23 @@ class ConfirmResumeImportRequest(BaseModel):
 
 
 class UpdateCandidateProfileRequest(BaseModel):
+    full_name: str | None = None
+    email: str | None = None
+    phone: str | None = None
+    location: str | None = None
+    linkedin_url: str | None = None
+    github_url: str | None = None
+    portfolio_url: str | None = None
     summary: str | None = None
+
+
+class GenerateJobCvRequest(BaseModel):
+    job_id: int
+
+
+class GenerateJobCvResponse(BaseModel):
+    job_id: int
+    artifact: GeneratedCvArtifact
 
 
 class GenerateResumeSummaryRequest(BaseModel):

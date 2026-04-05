@@ -2,10 +2,11 @@ import logging
 import threading
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 
 from app.persistence.sqlite import SQLiteJobStore, get_job_store
 from app.schemas.jobs import (
+    GenerateJobCvResponse,
     JobDetail,
     JobCheckBatchRun,
     JobListItem,
@@ -18,6 +19,7 @@ from app.schemas.jobs import (
 )
 from app.services.compatibility import get_compatibility_service
 from app.services.candidate_compatibility import get_candidate_compatibility_service
+from app.services.job_cv_generation import get_job_cv_generation_service
 from app.services.compatibility_errors import (
     CompatibilityProviderConfigurationError,
     CompatibilityProviderRequestError,
@@ -28,6 +30,7 @@ from app.services.compatibility_errors import (
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 _candidate_compatibility_jobs_in_progress: set[int] = set()
+_job_cv_generation_jobs_in_progress: set[int] = set()
 logger = logging.getLogger(__name__)
 _job_check_batch_lock = threading.Lock()
 _active_job_check_batch_id: int | None = None
@@ -348,6 +351,72 @@ def run_candidate_compatibility_check(
         )
     finally:
         _candidate_compatibility_jobs_in_progress.discard(job_id)
+
+
+@router.post("/{job_id}/generate-cv", response_model=GenerateJobCvResponse)
+def generate_job_cv(
+    job_id: int,
+    job_store: SQLiteJobStore = Depends(get_job_store),
+) -> GenerateJobCvResponse:
+    if job_id in _job_cv_generation_jobs_in_progress:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="CV generation is already running for this job.",
+        )
+
+    job = job_store.get_job_detail(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Job not found.",
+        )
+
+    _job_cv_generation_jobs_in_progress.add(job_id)
+    try:
+        artifact = get_job_cv_generation_service().generate_cv(job=job, job_store=job_store)
+        return GenerateJobCvResponse(job_id=job_id, artifact=artifact)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(error),
+        ) from error
+    except CompatibilityProviderConfigurationError as error:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(error),
+        ) from error
+    except CompatibilityProviderTimeoutError as error:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="CV generation timed out.",
+        ) from error
+    except CompatibilityProviderResponseError as error:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=str(error),
+        ) from error
+    except CompatibilityProviderRequestError as error:
+        raise _build_provider_request_http_error(error) from error
+    finally:
+        _job_cv_generation_jobs_in_progress.discard(job_id)
+
+
+@router.get("/generated-cvs/{artifact_id}/download")
+def download_generated_cv(
+    artifact_id: int,
+    job_store: SQLiteJobStore = Depends(get_job_store),
+) -> FileResponse:
+    artifact = job_store.get_generated_cv_artifact(artifact_id)
+    if artifact is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Generated CV not found.",
+        )
+    return FileResponse(
+        artifact.file_path,
+        media_type="text/markdown; charset=utf-8",
+        filename=artifact.filename,
+    )
 
 
 @router.delete("/{job_id}", status_code=status.HTTP_204_NO_CONTENT)

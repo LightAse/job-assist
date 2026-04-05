@@ -5,7 +5,7 @@ from pathlib import Path
 
 from app.api.routes.resume_profiles import confirm_resume_import, parse_resume_import
 from app.persistence.sqlite import SQLiteJobStore
-from app.schemas.jobs import ConfirmResumeImportRequest, ParseResumeImportRequest
+from app.schemas.jobs import ConfirmResumeImportRequest, ParseResumeImportRequest, UpdateCandidateProfileRequest
 from app.services.resume_import import parse_resume_text
 
 
@@ -111,3 +111,32 @@ def test_confirm_resume_import_persists_reviewed_structured_data(tmp_path: Path)
     assert [skill.name for skill in workspace.skills] == ["FastAPI", "Python"] or [skill.name for skill in workspace.skills] == ["Python", "FastAPI"]
     assert workspace.work_experiences[0].company == "Example Co"
     assert workspace.links[0].url == "https://linkedin.com/in/example"
+
+
+def test_confirm_resume_import_summary_preserves_existing_personal_data(tmp_path: Path) -> None:
+    store = SQLiteJobStore(tmp_path / "resume_import_preserve_candidate_profile.db")
+    store.update_candidate_profile(
+        UpdateCandidateProfileRequest(
+            full_name="Jane Doe",
+            email="jane@example.com",
+            phone="+1 555 010 1234",
+            location="Austin, TX",
+            linkedin_url="https://linkedin.com/in/jane",
+            github_url="https://github.com/jane",
+            portfolio_url="https://jane.dev",
+        )
+    )
+
+    workspace = confirm_resume_import(
+        ConfirmResumeImportRequest(summary="Imported summary"),
+        job_store=store,
+    )
+
+    assert workspace.candidate_profile.summary == "Imported summary"
+    assert workspace.candidate_profile.full_name == "Jane Doe"
+    assert workspace.candidate_profile.email == "jane@example.com"
+    assert workspace.candidate_profile.phone == "+1 555 010 1234"
+    assert workspace.candidate_profile.location == "Austin, TX"
+    assert workspace.candidate_profile.linkedin_url == "https://linkedin.com/in/jane"
+    assert workspace.candidate_profile.github_url == "https://github.com/jane"
+    assert workspace.candidate_profile.portfolio_url == "https://jane.dev"

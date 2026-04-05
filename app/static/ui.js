@@ -36,6 +36,9 @@ const resumeUiState = {
     languages: null,
     links: null,
   },
+  jobCvGeneration: {
+    loadingJobId: null,
+  },
 };
 
 const jobsUiState = {
@@ -410,6 +413,30 @@ function renderCandidateCompatibilitySummary(check) {
       </div>
       ${createMetaRow("Created At", formatValue(check.created_at), { detail: true })}
       ${createTextBlock("Reason", check.short_reason)}
+    </div>
+  `;
+}
+
+function renderGeneratedCvSummary(artifacts) {
+  if (!artifacts || artifacts.length === 0) {
+    return `<p class="muted">No generated CV saved for this job yet.</p>`;
+  }
+
+  return `
+    <div class="collection-list">
+      ${artifacts
+        .map(
+          (artifact) => `
+            <article class="collection-item">
+              <strong>${escapeHtml(artifact.filename)}</strong>
+              <div class="muted">Generated ${escapeHtml(formatShortDate(artifact.updated_at || artifact.created_at))}</div>
+              <div class="actions compact-actions">
+                <a class="button button-secondary" href="/jobs/generated-cvs/${artifact.id}/download" target="_blank" rel="noreferrer">Download</a>
+              </div>
+            </article>
+          `
+        )
+        .join("")}
     </div>
   `;
 }
@@ -1233,6 +1260,7 @@ async function renderJobDetails(root, jobId) {
         <p class="muted">This score uses Candidate Data directly and does not require generating a final CV first.</p>
         <div class="actions">
           <button id="check-button" class="button button-secondary" type="button">${job.latest_candidate_compatibility_check ? "Re-run Check" : "Run Check"}</button>
+          <button id="generate-cv-button" class="button button-primary" type="button" ${resumeUiState.jobCvGeneration.loadingJobId === job.id ? "disabled" : ""}>${resumeUiState.jobCvGeneration.loadingJobId === job.id ? "Generating..." : "Generate CV"}</button>
           <a class="button button-secondary" href="/candidate-profile/view">Open Candidate Data</a>
           <button id="delete-button" class="button button-danger">Delete</button>
           <a class="button button-primary" href="/">Back</a>
@@ -1242,6 +1270,11 @@ async function renderJobDetails(root, jobId) {
       <h3 class="section-title">Latest Result</h3>
       <section id="compatibility-result">
         ${renderCandidateCompatibilitySummary(job.latest_candidate_compatibility_check)}
+      </section>
+
+      <h3 class="section-title">Generated CV</h3>
+      <section id="generated-cv-result">
+        ${renderGeneratedCvSummary(job.generated_cvs)}
       </section>
     </article>
   `;
@@ -1274,6 +1307,25 @@ async function renderJobDetails(root, jobId) {
     } finally {
       button.disabled = false;
       button.textContent = idleLabel;
+    }
+  });
+
+  root.querySelector("#generate-cv-button").addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    if (!button || button.disabled) {
+      return;
+    }
+    resumeUiState.jobCvGeneration.loadingJobId = job.id;
+    await renderJobDetails(root, job.id);
+    try {
+      const response = await fetchJson(`/jobs/${job.id}/generate-cv`, { method: "POST" });
+      root.querySelector("#generated-cv-result").innerHTML = renderGeneratedCvSummary([response.artifact]);
+      showMessage(`Generated CV saved as ${response.artifact.filename}.`);
+    } catch (error) {
+      showMessage(error.message);
+    } finally {
+      resumeUiState.jobCvGeneration.loadingJobId = null;
+      await renderJobDetails(root, job.id);
     }
   });
 }
@@ -1634,7 +1686,7 @@ function renderCandidateProfilePanel(candidateProfile) {
       <div class="section-header">
         <div>
           <h2>Candidate Profile</h2>
-          <p class="muted">Master candidate summary used as source material. This is not final resume copy.</p>
+          <p class="muted">Master personal and profile source data used for job-specific CV generation.</p>
         </div>
         <div class="actions compact-actions">
           <label class="button button-secondary import-button" for="cv-import-input">Import CV</label>
@@ -1642,6 +1694,34 @@ function renderCandidateProfilePanel(candidateProfile) {
         </div>
       </div>
       <form id="candidate-profile-form">
+        <div class="form-row">
+          <label class="detail-label" for="candidate-full-name">Full Name</label>
+          <input id="candidate-full-name" name="full_name" class="input" type="text" value="${escapeHtml(candidateProfile.full_name || "")}" placeholder="Jane Doe">
+        </div>
+        <div class="form-row">
+          <label class="detail-label" for="candidate-email">Email</label>
+          <input id="candidate-email" name="email" class="input" type="email" value="${escapeHtml(candidateProfile.email || "")}" placeholder="jane@example.com">
+        </div>
+        <div class="form-row">
+          <label class="detail-label" for="candidate-phone">Phone</label>
+          <input id="candidate-phone" name="phone" class="input" type="text" value="${escapeHtml(candidateProfile.phone || "")}" placeholder="+1 555 010 1234">
+        </div>
+        <div class="form-row">
+          <label class="detail-label" for="candidate-location">Location / Address</label>
+          <input id="candidate-location" name="location" class="input" type="text" value="${escapeHtml(candidateProfile.location || "")}" placeholder="Buenos Aires, Argentina">
+        </div>
+        <div class="form-row">
+          <label class="detail-label" for="candidate-linkedin-url">LinkedIn URL</label>
+          <input id="candidate-linkedin-url" name="linkedin_url" class="input" type="text" value="${escapeHtml(candidateProfile.linkedin_url || "")}" placeholder="https://linkedin.com/in/example">
+        </div>
+        <div class="form-row">
+          <label class="detail-label" for="candidate-github-url">GitHub URL</label>
+          <input id="candidate-github-url" name="github_url" class="input" type="text" value="${escapeHtml(candidateProfile.github_url || "")}" placeholder="https://github.com/example">
+        </div>
+        <div class="form-row">
+          <label class="detail-label" for="candidate-portfolio-url">Portfolio URL</label>
+          <input id="candidate-portfolio-url" name="portfolio_url" class="input" type="text" value="${escapeHtml(candidateProfile.portfolio_url || "")}" placeholder="https://example.com">
+        </div>
         <div class="form-row">
           <label class="detail-label" for="candidate-profile-summary">Candidate Summary / About Me Source</label>
           <textarea id="candidate-profile-summary" name="summary" class="input input-large" placeholder="Store long-term candidate summary notes here.">${escapeHtml(candidateProfile.summary || "")}</textarea>
@@ -2278,7 +2358,16 @@ function attachResumePageHandlers(root, profileDetail) {
         await fetchJson("/candidate-profile", {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ summary: optionalValue(formData.get("summary")) }),
+          body: JSON.stringify({
+            full_name: optionalValue(formData.get("full_name")),
+            email: optionalValue(formData.get("email")),
+            phone: optionalValue(formData.get("phone")),
+            location: optionalValue(formData.get("location")),
+            linkedin_url: optionalValue(formData.get("linkedin_url")),
+            github_url: optionalValue(formData.get("github_url")),
+            portfolio_url: optionalValue(formData.get("portfolio_url")),
+            summary: optionalValue(formData.get("summary")),
+          }),
         });
         await rerenderResumeView(root);
         showMessage("Candidate profile updated.");

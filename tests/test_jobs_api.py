@@ -4,7 +4,9 @@ import pytest
 from fastapi import HTTPException
 
 from app.api.routes.jobs import (
+    download_generated_cv,
     delete_job,
+    generate_job_cv,
     get_job,
     list_jobs,
     run_candidate_compatibility_check,
@@ -13,7 +15,14 @@ from app.api.routes.jobs import (
 )
 from app.api.routes.resume_profiles import create_resume_profile, list_resume_profiles
 from app.persistence.sqlite import SQLiteJobStore
-from app.schemas.jobs import CreateResumeProfileRequest, RunCompatibilityCheckRequest, UpdateJobStatusRequest
+from app.schemas.jobs import (
+    CreateMasterSkillRequest,
+    CreateMasterWorkExperienceRequest,
+    CreateResumeProfileRequest,
+    RunCompatibilityCheckRequest,
+    UpdateCandidateProfileRequest,
+    UpdateJobStatusRequest,
+)
 from app.schemas.scrape import ScrapeCurrentRequest, ScrapeCurrentResponse
 from app.services.compatibility_errors import CompatibilityProviderRequestError
 
@@ -214,6 +223,71 @@ def test_run_candidate_compatibility_check_maps_openrouter_privacy_error_to_clea
         "The selected OpenRouter model is unavailable under your current Privacy/Data Policy settings. "
         "Check OpenRouter Settings -> Privacy or choose another model."
     )
+
+
+def test_generate_job_cv_persists_artifact_and_exposes_download(
+    temp_job_store: SQLiteJobStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_id = _save_job(
+        temp_job_store,
+        job_id="1234567890",
+        title="Senior Backend Engineer",
+        company="Example Co",
+        location="Remote",
+        visible_text="Senior Backend Engineer at Example Co\nPython FastAPI Postgres",
+    )
+    temp_job_store.update_candidate_profile(
+        UpdateCandidateProfileRequest(
+            full_name="Jane Doe",
+            email="jane@example.com",
+            phone="+1 555 010 1234",
+            location="Austin, TX",
+            linkedin_url="https://linkedin.com/in/jane",
+            summary="Backend engineer with Python API experience.",
+        )
+    )
+    temp_job_store.create_master_skill(CreateMasterSkillRequest(name="Python", proficiency_level="Advanced"))
+    temp_job_store.create_master_work_experience(
+        CreateMasterWorkExperienceRequest(
+            company="Previous Co",
+            title="Backend Engineer",
+            summary="Built Python APIs.",
+            highlights=["Built FastAPI services", "Worked with Postgres"],
+        )
+    )
+
+    class FakeGenerator:
+        def generate_summary_from_sources(self, **kwargs):
+            return "Backend engineer focused on Python API delivery for distributed teams."
+
+        def generate_skills_from_sources(self, **kwargs):
+            return ["Python", "FastAPI", "Postgres"]
+
+    monkeypatch.setattr("app.services.job_cv_generation.get_summary_generation_service", lambda: FakeGenerator())
+
+    response = generate_job_cv(job_id=job_id, job_store=temp_job_store)
+
+    assert response.job_id == job_id
+    assert response.artifact.filename == f"jane_doe_cv_example_co_{job_id}.md"
+    assert Path(response.artifact.file_path).exists()
+
+    job = get_job(job_id=job_id, job_store=temp_job_store)
+    assert job.generated_cvs
+    assert job.generated_cvs[0].id == response.artifact.id
+
+    download_response = download_generated_cv(response.artifact.id, job_store=temp_job_store)
+    assert download_response.filename == response.artifact.filename
+
+
+def test_generate_job_cv_requires_candidate_personal_data(temp_job_store: SQLiteJobStore) -> None:
+    job_id = _save_job(temp_job_store)
+
+    with pytest.raises(HTTPException) as error:
+        generate_job_cv(job_id=job_id, job_store=temp_job_store)
+
+    assert error.value.status_code == 400
+    assert error.value.detail == "Candidate Data is missing required fields: full name, email, phone, location."
 
 
 def test_run_compatibility_check_persists_result(temp_job_store: SQLiteJobStore) -> None:

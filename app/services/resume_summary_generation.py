@@ -83,10 +83,31 @@ class OpenRouterSummaryGenerationService:
         resume_profile: ResumeProfileDetail,
         job_store: SQLiteJobStore,
     ) -> SummaryGenerationResult:
-        session_id = self.provider._create_session()
-        payload = self._build_message_payload(job=job, resume_profile=resume_profile, job_store=job_store)
-        response_body = self.provider._post_json(f"/session/{session_id}/message", payload)
-        summary = self._extract_summary_text(response_body)
+        summary_section = next(
+            (section for section in resume_profile.sections if section.section_key == "summary"),
+            None,
+        )
+        skills_section = next(
+            (section for section in resume_profile.sections if section.section_key == "skills"),
+            None,
+        )
+        experience_section = next(
+            (section for section in resume_profile.sections if section.section_key == "experience"),
+            None,
+        )
+        projects_section = next(
+            (section for section in resume_profile.sections if section.section_key == "projects"),
+            None,
+        )
+        summary = self.generate_summary_from_sources(
+            job=job,
+            summary_source=summary_section.source_material if summary_section else "N/A",
+            skills_source=skills_section.source_material if skills_section else "N/A",
+            projects_source=projects_section.source_material if projects_section else "N/A",
+            experience_source=experience_section.source_material if experience_section else "N/A",
+            profile_prompt=summary_section.custom_instructions if summary_section else None,
+            job_store=job_store,
+        )
         job_store.save_resume_profile_section_generation(
             resume_profile_id=resume_profile.id,
             section_key="summary",
@@ -101,16 +122,85 @@ class OpenRouterSummaryGenerationService:
         resume_profile: ResumeProfileDetail,
         job_store: SQLiteJobStore,
     ) -> SkillsGenerationResult:
-        session_id = self.provider._create_session()
-        payload = self._build_skills_message_payload(job=job, resume_profile=resume_profile, job_store=job_store)
-        response_body = self.provider._post_json(f"/session/{session_id}/message", payload)
-        skills = self._extract_skills_text(response_body)
+        summary_section = next(
+            (section for section in resume_profile.sections if section.section_key == "summary"),
+            None,
+        )
+        skills_section = next(
+            (section for section in resume_profile.sections if section.section_key == "skills"),
+            None,
+        )
+        experience_section = next(
+            (section for section in resume_profile.sections if section.section_key == "experience"),
+            None,
+        )
+        projects_section = next(
+            (section for section in resume_profile.sections if section.section_key == "projects"),
+            None,
+        )
+        skills = self.generate_skills_from_sources(
+            job=job,
+            summary_source=summary_section.source_material if summary_section else "N/A",
+            skills_source=skills_section.source_material if skills_section else "N/A",
+            projects_source=projects_section.source_material if projects_section else "N/A",
+            experience_source=experience_section.source_material if experience_section else "N/A",
+            profile_prompt=skills_section.custom_instructions if skills_section else None,
+            job_store=job_store,
+        )
         job_store.save_resume_profile_section_generation(
             resume_profile_id=resume_profile.id,
             section_key="skills",
             generated_content="\n".join(f"- {skill}" for skill in skills),
         )
         return SkillsGenerationResult(generated_skills=skills)
+
+    def generate_summary_from_sources(
+        self,
+        *,
+        job: JobDetail,
+        summary_source: str,
+        skills_source: str,
+        projects_source: str,
+        experience_source: str,
+        profile_prompt: str | None,
+        job_store: SQLiteJobStore,
+    ) -> str:
+        session_id = self.provider._create_session()
+        payload = self._build_message_payload_from_sources(
+            job=job,
+            summary_source=summary_source,
+            skills_source=skills_source,
+            projects_source=projects_source,
+            experience_source=experience_source,
+            profile_prompt=profile_prompt,
+            job_store=job_store,
+        )
+        response_body = self.provider._post_json(f"/session/{session_id}/message", payload)
+        return self._extract_summary_text(response_body)
+
+    def generate_skills_from_sources(
+        self,
+        *,
+        job: JobDetail,
+        summary_source: str,
+        skills_source: str,
+        projects_source: str,
+        experience_source: str,
+        profile_prompt: str | None,
+        job_store: SQLiteJobStore,
+    ) -> list[str]:
+        session_id = self.provider._create_session()
+        payload = self._build_skills_message_payload_from_sources(
+            job=job,
+            summary_source=summary_source,
+            skills_source=skills_source,
+            projects_source=projects_source,
+            experience_source=experience_source,
+            profile_prompt=profile_prompt,
+            job_store=job_store,
+        )
+        response_body = self.provider._post_json(f"/session/{session_id}/message", payload)
+        return self._extract_skills_text(response_body)
 
     def _build_message_payload(
         self,
@@ -135,26 +225,15 @@ class OpenRouterSummaryGenerationService:
             (section for section in resume_profile.sections if section.section_key == "projects"),
             None,
         )
-        job_description = self.provider._job_source_text(job.latest_snapshot) if job.latest_snapshot else "N/A"
-        system_prompt = self._resolve_section_prompt(
-            section_key="summary",
+        return self._build_message_payload_from_sources(
+            job=job,
+            summary_source=summary_section.source_material if summary_section else "N/A",
+            skills_source=skills_section.source_material if skills_section else "N/A",
+            projects_source=projects_section.source_material if projects_section else "N/A",
+            experience_source=experience_section.source_material if experience_section else "N/A",
             profile_prompt=summary_section.custom_instructions if summary_section else None,
             job_store=job_store,
         )
-        prompt = (
-            f"Job description:\n{job_description}\n\n"
-            f"Candidate summary source:\n{summary_section.source_material if summary_section else 'N/A'}\n\n"
-            f"Selected skills:\n{skills_section.source_material if skills_section else 'N/A'}\n\n"
-            f"Selected projects:\n{projects_section.source_material if projects_section else 'N/A'}\n\n"
-            f"Selected experience:\n{experience_section.source_material if experience_section else 'N/A'}"
-        )
-        payload: dict[str, object] = {
-            "parts": [{"type": "text", "text": prompt}],
-            "system": system_prompt,
-        }
-        if self.provider.model:
-            payload["model"] = self.provider.model
-        return payload
 
     def _build_skills_message_payload(
         self,
@@ -179,18 +258,71 @@ class OpenRouterSummaryGenerationService:
             (section for section in resume_profile.sections if section.section_key == "projects"),
             None,
         )
+        return self._build_skills_message_payload_from_sources(
+            job=job,
+            summary_source=summary_section.source_material if summary_section else "N/A",
+            skills_source=skills_section.source_material if skills_section else "N/A",
+            projects_source=projects_section.source_material if projects_section else "N/A",
+            experience_source=experience_section.source_material if experience_section else "N/A",
+            profile_prompt=skills_section.custom_instructions if skills_section else None,
+            job_store=job_store,
+        )
+
+    def _build_message_payload_from_sources(
+        self,
+        *,
+        job: JobDetail,
+        summary_source: str,
+        skills_source: str,
+        projects_source: str,
+        experience_source: str,
+        profile_prompt: str | None,
+        job_store: SQLiteJobStore,
+    ) -> dict[str, object]:
         job_description = self.provider._job_source_text(job.latest_snapshot) if job.latest_snapshot else "N/A"
         system_prompt = self._resolve_section_prompt(
-            section_key="skills",
-            profile_prompt=skills_section.custom_instructions if skills_section else None,
+            section_key="summary",
+            profile_prompt=profile_prompt,
             job_store=job_store,
         )
         prompt = (
             f"Job description:\n{job_description}\n\n"
-            f"Candidate positioning:\n{summary_section.source_material if summary_section else 'N/A'}\n\n"
-            f"Selected skills:\n{skills_section.source_material if skills_section else 'N/A'}\n\n"
-            f"Selected projects:\n{projects_section.source_material if projects_section else 'N/A'}\n\n"
-            f"Selected experience:\n{experience_section.source_material if experience_section else 'N/A'}"
+            f"Candidate summary source:\n{summary_source}\n\n"
+            f"Selected skills:\n{skills_source}\n\n"
+            f"Selected projects:\n{projects_source}\n\n"
+            f"Selected experience:\n{experience_source}"
+        )
+        payload: dict[str, object] = {
+            "parts": [{"type": "text", "text": prompt}],
+            "system": system_prompt,
+        }
+        if self.provider.model:
+            payload["model"] = self.provider.model
+        return payload
+
+    def _build_skills_message_payload_from_sources(
+        self,
+        *,
+        job: JobDetail,
+        summary_source: str,
+        skills_source: str,
+        projects_source: str,
+        experience_source: str,
+        profile_prompt: str | None,
+        job_store: SQLiteJobStore,
+    ) -> dict[str, object]:
+        job_description = self.provider._job_source_text(job.latest_snapshot) if job.latest_snapshot else "N/A"
+        system_prompt = self._resolve_section_prompt(
+            section_key="skills",
+            profile_prompt=profile_prompt,
+            job_store=job_store,
+        )
+        prompt = (
+            f"Job description:\n{job_description}\n\n"
+            f"Candidate positioning:\n{summary_source}\n\n"
+            f"Selected skills:\n{skills_source}\n\n"
+            f"Selected projects:\n{projects_source}\n\n"
+            f"Selected experience:\n{experience_source}"
         )
         payload: dict[str, object] = {
             "parts": [{"type": "text", "text": prompt}],

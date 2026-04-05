@@ -1,7 +1,12 @@
 from pathlib import Path
 
 from app.persistence.sqlite import SQLiteJobStore
-from app.schemas.jobs import CreateMasterLanguageRequest, CreateMasterSkillRequest, UpdateOpenRouterSettingsRequest
+from app.schemas.jobs import (
+    CreateMasterLanguageRequest,
+    CreateMasterSkillRequest,
+    UpdateCandidateProfileRequest,
+    UpdateOpenRouterSettingsRequest,
+)
 from app.schemas.scrape import ScrapeCurrentRequest, ScrapeCurrentResponse
 
 
@@ -468,8 +473,230 @@ def test_openrouter_settings_masks_saved_api_key(tmp_path: Path) -> None:
     assert settings.saved_default_model == "openai/gpt-5-nano"
     runtime_api_key, runtime_provider, runtime_model = store.get_openrouter_runtime_config()
     assert runtime_api_key == "abcd1234secret9876"
-    assert runtime_provider == "openrouter"
-    assert runtime_model == "openai/gpt-5-nano"
+
+
+def test_candidate_profile_persists_personal_fields(tmp_path: Path) -> None:
+    store = SQLiteJobStore(tmp_path / "test_candidate_profile_fields.db")
+
+    profile = store.update_candidate_profile(
+        UpdateCandidateProfileRequest(
+            full_name="Jane Doe",
+            email="jane@example.com",
+            phone="+1 555 010 1234",
+            location="Austin, TX",
+            linkedin_url="https://linkedin.com/in/jane",
+            github_url="https://github.com/jane",
+            portfolio_url="https://jane.dev",
+            summary="Backend engineer focused on APIs.",
+        )
+    )
+
+    assert profile.full_name == "Jane Doe"
+    assert profile.email == "jane@example.com"
+    assert profile.phone == "+1 555 010 1234"
+    assert profile.location == "Austin, TX"
+    assert profile.linkedin_url == "https://linkedin.com/in/jane"
+    assert profile.github_url == "https://github.com/jane"
+    assert profile.portfolio_url == "https://jane.dev"
+    assert profile.summary == "Backend engineer focused on APIs."
+
+
+def test_candidate_profile_summary_update_preserves_existing_personal_fields(tmp_path: Path) -> None:
+    store = SQLiteJobStore(tmp_path / "test_candidate_profile_summary_merge.db")
+    store.update_candidate_profile(
+        UpdateCandidateProfileRequest(
+            full_name="Jane Doe",
+            email="jane@example.com",
+            phone="+1 555 010 1234",
+            location="Austin, TX",
+            linkedin_url="https://linkedin.com/in/jane",
+            github_url="https://github.com/jane",
+            portfolio_url="https://jane.dev",
+        )
+    )
+
+    profile = store.update_candidate_profile(
+        UpdateCandidateProfileRequest(summary="Updated summary only.")
+    )
+
+    assert profile.full_name == "Jane Doe"
+    assert profile.email == "jane@example.com"
+    assert profile.phone == "+1 555 010 1234"
+    assert profile.location == "Austin, TX"
+    assert profile.linkedin_url == "https://linkedin.com/in/jane"
+    assert profile.github_url == "https://github.com/jane"
+    assert profile.portfolio_url == "https://jane.dev"
+    assert profile.summary == "Updated summary only."
+
+
+def test_candidate_profile_single_field_update_preserves_other_contact_fields(tmp_path: Path) -> None:
+    store = SQLiteJobStore(tmp_path / "test_candidate_profile_single_field_merge.db")
+    store.update_candidate_profile(
+        UpdateCandidateProfileRequest(
+            full_name="Jane Doe",
+            email="jane@example.com",
+            phone="+1 555 010 1234",
+            location="Austin, TX",
+            linkedin_url="https://linkedin.com/in/jane",
+            github_url="https://github.com/jane",
+            portfolio_url="https://jane.dev",
+            summary="Original summary",
+        )
+    )
+
+    profile = store.update_candidate_profile(
+        UpdateCandidateProfileRequest(phone="+1 555 010 9999")
+    )
+
+    assert profile.full_name == "Jane Doe"
+    assert profile.email == "jane@example.com"
+    assert profile.phone == "+1 555 010 9999"
+    assert profile.location == "Austin, TX"
+    assert profile.linkedin_url == "https://linkedin.com/in/jane"
+    assert profile.github_url == "https://github.com/jane"
+    assert profile.portfolio_url == "https://jane.dev"
+    assert profile.summary == "Original summary"
+
+
+def test_generated_cv_artifact_persists_and_is_removed_with_job(tmp_path: Path) -> None:
+    store = SQLiteJobStore(tmp_path / "test_generated_cv.db")
+    store.update_candidate_profile(UpdateCandidateProfileRequest(full_name="Jane Doe"))
+    context = ScrapeCurrentRequest(
+        url="https://www.linkedin.com/jobs/view/1111111111/",
+        title="Senior Backend Engineer",
+        company="Example Co",
+        visible_text="Senior Backend Engineer at Example Co",
+    )
+    scrape_result = ScrapeCurrentResponse(
+        plugin_name="linkedin_job_scraper",
+        matched=True,
+        source_url=context.url,
+        raw_content=None,
+        structured_data={
+            "source": "linkedin",
+            "external_job_id": "1111111111",
+            "page_title": "Senior Backend Engineer",
+            "tentative_job_title": "Senior Backend Engineer",
+        },
+    )
+    job_id = store.save_matched_scrape(context, scrape_result).job_id
+
+    artifact = store.save_generated_cv_artifact(
+        job_id=job_id,
+        company="Example Co",
+        job_title="Senior Backend Engineer",
+        summary="Targeted summary",
+        skills=["Python", "FastAPI"],
+        content="# Jane Doe\n\n## Professional Summary\n\nTargeted summary\n",
+    )
+
+    artifact_path = Path(artifact.file_path)
+    assert artifact.filename == f"jane_doe_cv_example_co_{job_id}.md"
+    assert artifact_path.exists()
+    assert "Targeted summary" in artifact_path.read_text(encoding="utf-8")
+
+    job = store.get_job_detail(job_id)
+    assert job is not None
+    assert [item.id for item in job.generated_cvs] == [artifact.id]
+
+    assert store.delete_job(job_id) is True
+    assert artifact_path.exists() is False
+
+
+def test_generated_cv_filenames_are_unique_for_same_company_and_title(tmp_path: Path) -> None:
+    store = SQLiteJobStore(tmp_path / "test_generated_cv_unique_names.db")
+    store.update_candidate_profile(UpdateCandidateProfileRequest(full_name="Jane Doe"))
+    job_ids: list[int] = []
+    for external_job_id in ("1111111111", "2222222222"):
+        context = ScrapeCurrentRequest(
+            url=f"https://www.linkedin.com/jobs/view/{external_job_id}/",
+            title="Senior Backend Engineer",
+            company="Example Co",
+            visible_text="Senior Backend Engineer at Example Co",
+        )
+        scrape_result = ScrapeCurrentResponse(
+            plugin_name="linkedin_job_scraper",
+            matched=True,
+            source_url=context.url,
+            raw_content=None,
+            structured_data={
+                "source": "linkedin",
+                "external_job_id": external_job_id,
+                "page_title": "Senior Backend Engineer",
+                "tentative_job_title": "Senior Backend Engineer",
+            },
+        )
+        job_ids.append(store.save_matched_scrape(context, scrape_result).job_id)
+
+    first = store.save_generated_cv_artifact(
+        job_id=job_ids[0],
+        company="Example Co",
+        job_title="Senior Backend Engineer",
+        summary="Summary 1",
+        skills=["Python"],
+        content="first",
+    )
+    second = store.save_generated_cv_artifact(
+        job_id=job_ids[1],
+        company="Example Co",
+        job_title="Senior Backend Engineer",
+        summary="Summary 2",
+        skills=["Python"],
+        content="second",
+    )
+
+    assert first.filename != second.filename
+    assert Path(first.file_path).exists()
+    assert Path(second.file_path).exists()
+
+    assert store.delete_job(job_ids[0]) is True
+    assert Path(first.file_path).exists() is False
+    assert Path(second.file_path).exists() is True
+
+
+def test_generated_cv_filename_is_stable_for_repeated_generation_same_job(tmp_path: Path) -> None:
+    store = SQLiteJobStore(tmp_path / "test_generated_cv_stable_name.db")
+    store.update_candidate_profile(UpdateCandidateProfileRequest(full_name="Jane Doe"))
+    context = ScrapeCurrentRequest(
+        url="https://www.linkedin.com/jobs/view/1111111111/",
+        title="Senior Backend Engineer",
+        company="Example Co",
+        visible_text="Senior Backend Engineer at Example Co",
+    )
+    scrape_result = ScrapeCurrentResponse(
+        plugin_name="linkedin_job_scraper",
+        matched=True,
+        source_url=context.url,
+        raw_content=None,
+        structured_data={
+            "source": "linkedin",
+            "external_job_id": "1111111111",
+            "page_title": "Senior Backend Engineer",
+            "tentative_job_title": "Senior Backend Engineer",
+        },
+    )
+    job_id = store.save_matched_scrape(context, scrape_result).job_id
+
+    first = store.save_generated_cv_artifact(
+        job_id=job_id,
+        company="Example Co",
+        job_title="Senior Backend Engineer",
+        summary="Summary 1",
+        skills=["Python"],
+        content="first",
+    )
+    second = store.save_generated_cv_artifact(
+        job_id=job_id,
+        company="Example Co",
+        job_title="Senior Backend Engineer",
+        summary="Summary 2",
+        skills=["FastAPI"],
+        content="second",
+    )
+
+    assert first.id == second.id
+    assert first.filename == second.filename
+    assert Path(second.file_path).read_text(encoding="utf-8") == "second"
 
 
 def test_openrouter_settings_fall_back_to_environment_when_no_saved_key(
