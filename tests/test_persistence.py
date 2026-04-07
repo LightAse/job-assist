@@ -248,6 +248,31 @@ def test_candidate_compatibility_latest_result_survives_store_reopen(tmp_path: P
     assert job_detail.latest_candidate_compatibility_check.short_reason == "Improved fit after updating candidate data."
 
 
+def test_job_run_status_transitions_survive_store_reopen(tmp_path: Path) -> None:
+    database_path = tmp_path / "test_job_run_reopen.db"
+    store = SQLiteJobStore(database_path)
+
+    created_run = store.create_job_run(
+        job_type="candidate_compatibility_check",
+        payload={"job_id": 123},
+        target_job_id=123,
+    )
+    running_run = store.start_job_run(created_run.id)
+    assert running_run is not None
+    store.complete_job_run(run_id=created_run.id, result={"compatibility_check_id": 99})
+
+    reopened_store = SQLiteJobStore(database_path)
+    persisted_run = reopened_store.get_job_run(created_run.id)
+
+    assert persisted_run is not None
+    assert created_run.status == "pending"
+    assert running_run.status == "running"
+    assert persisted_run.status == "completed"
+    assert persisted_run.started_at is not None
+    assert persisted_run.finished_at is not None
+    assert persisted_run.result_json == '{"compatibility_check_id": 99}'
+
+
 def test_job_status_survives_store_reopen(tmp_path: Path) -> None:
     database_path = tmp_path / "test_job_status_reopen.db"
     store = SQLiteJobStore(database_path)

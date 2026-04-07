@@ -24,6 +24,30 @@ h1 {
   color: #47627d;
 }
 
+.field-label {
+  display: block;
+  margin: 0 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #39536d;
+}
+
+.backend-config {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+input[type="url"] {
+  width: 100%;
+  border: 1px solid #b7c8da;
+  border-radius: 10px;
+  padding: 10px 12px;
+  font: inherit;
+  color: #13212f;
+  background: #ffffff;
+}
+
 .actions {
   display: grid;
   gap: 8px;

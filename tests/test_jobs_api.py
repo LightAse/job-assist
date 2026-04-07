@@ -194,6 +194,59 @@ def test_run_candidate_compatibility_check_persists_result(temp_job_store: SQLit
     assert jobs[0].latest_candidate_compatibility_check.score == 82
 
 
+def test_run_candidate_compatibility_check_persists_job_run(
+    temp_job_store: SQLiteJobStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_id = _save_job(
+        temp_job_store,
+        job_id="7777777777",
+        title="Senior Backend Engineer",
+        company="Example Co",
+        location="Remote",
+        visible_text="Senior Backend Engineer at Example Co\nPython FastAPI Postgres Remote",
+    )
+    temp_job_store.update_candidate_profile(type("Payload", (), {"summary": "Backend engineer with Python and FastAPI experience."})())
+
+    class FakeService:
+        def evaluate(self, *, job, job_store):
+            return type(
+                "Result",
+                (),
+                {
+                    "score": 75,
+                    "short_reason": "Relevant backend skills match the role.",
+                    "strengths": ["Python"],
+                    "gaps": ["AWS"],
+                    "raw_model_response": '{"score":75}',
+                },
+            )()
+
+    monkeypatch.setattr("app.api.routes.jobs.get_candidate_compatibility_service", lambda: FakeService())
+
+    response = run_candidate_compatibility_check(job_id=job_id, job_store=temp_job_store)
+
+    with temp_job_store._connect() as connection:
+        run_row = connection.execute(
+            """
+            SELECT job_type, target_job_id, status, started_at, finished_at
+            FROM job_runs
+            WHERE target_job_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (job_id,),
+        ).fetchone()
+
+    assert response.compatibility_check.score == 75
+    assert run_row is not None
+    assert run_row["job_type"] == "candidate_compatibility_check"
+    assert run_row["target_job_id"] == job_id
+    assert run_row["status"] == "completed"
+    assert run_row["started_at"] is not None
+    assert run_row["finished_at"] is not None
+
+
 def test_run_candidate_compatibility_check_maps_openrouter_privacy_error_to_clear_message(
     temp_job_store: SQLiteJobStore,
     monkeypatch: pytest.MonkeyPatch,

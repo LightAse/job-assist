@@ -24,6 +24,7 @@ from app.schemas.jobs import (
     JobCheckBatchItem,
     JobCheckBatchRun,
     JobListItem,
+    JobRun,
     LatestJobSnapshot,
     MasterCertification,
     MasterEducation,
@@ -389,6 +390,19 @@ class SQLiteJobStore:
                     FOREIGN KEY (job_id) REFERENCES jobs (id)
                 );
 
+                CREATE TABLE IF NOT EXISTS job_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_type TEXT NOT NULL,
+                    target_job_id INTEGER,
+                    status TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    result_json TEXT,
+                    error_text TEXT,
+                    created_at TEXT NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT
+                );
+
                 CREATE TABLE IF NOT EXISTS job_check_batches (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     mode TEXT NOT NULL,
@@ -420,6 +434,12 @@ class SQLiteJobStore:
 
                 CREATE INDEX IF NOT EXISTS idx_job_snapshots_job_id
                 ON job_snapshots (job_id);
+
+                CREATE INDEX IF NOT EXISTS idx_job_runs_status_id
+                ON job_runs (status, id);
+
+                CREATE INDEX IF NOT EXISTS idx_job_runs_type_target_status
+                ON job_runs (job_type, target_job_id, status);
 
                 CREATE INDEX IF NOT EXISTS idx_job_check_batch_items_batch_id
                 ON job_check_batch_items (batch_id);
@@ -2632,6 +2652,206 @@ class SQLiteJobStore:
             ).fetchone()
         return self._row_to_candidate_compatibility_check(row)
 
+    def create_job_run(
+        self,
+        *,
+        job_type: str,
+        payload: dict[str, object],
+        target_job_id: int | None = None,
+    ) -> JobRun:
+        timestamp = _utc_now_iso()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO job_runs (
+                    job_type,
+                    target_job_id,
+                    status,
+                    payload_json,
+                    result_json,
+                    error_text,
+                    created_at,
+                    started_at,
+                    finished_at
+                ) VALUES (?, ?, 'pending', ?, NULL, NULL, ?, NULL, NULL)
+                """,
+                (job_type, target_job_id, json.dumps(payload), timestamp),
+            )
+        job_run = self.get_job_run(int(cursor.lastrowid))
+        if job_run is None:
+            raise ValueError("Job run was created but could not be loaded.")
+        return job_run
+
+    def get_job_run(self, run_id: int) -> JobRun | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    id,
+                    job_type,
+                    target_job_id,
+                    status,
+                    payload_json,
+                    result_json,
+                    error_text,
+                    created_at,
+                    started_at,
+                    finished_at
+                FROM job_runs
+                WHERE id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+        return self._row_to_job_run(row) if row else None
+
+    def find_active_job_run(self, *, job_type: str, target_job_id: int | None = None) -> JobRun | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    id,
+                    job_type,
+                    target_job_id,
+                    status,
+                    payload_json,
+                    result_json,
+                    error_text,
+                    created_at,
+                    started_at,
+                    finished_at
+                FROM job_runs
+                WHERE job_type = ?
+                  AND (
+                        target_job_id = ?
+                        OR (target_job_id IS NULL AND ? IS NULL)
+                  )
+                  AND status IN ('pending', 'running')
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (job_type, target_job_id, target_job_id),
+            ).fetchone()
+        return self._row_to_job_run(row) if row else None
+
+    def start_job_run(self, run_id: int) -> JobRun | None:
+        timestamp = _utc_now_iso()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE job_runs
+                SET status = 'running',
+                    started_at = COALESCE(started_at, ?),
+                    finished_at = NULL,
+                    error_text = NULL
+                WHERE id = ?
+                  AND status IN ('pending', 'running')
+                """,
+                (timestamp, run_id),
+            )
+            if cursor.rowcount == 0:
+                return None
+        return self.get_job_run(run_id)
+
+    def claim_next_pending_job_run(self) -> JobRun | None:
+        timestamp = _utc_now_iso()
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, status
+                FROM job_runs
+                WHERE status IN ('pending', 'running')
+                ORDER BY id ASC
+                LIMIT 1
+                """
+            ).fetchone()
+            if row is None:
+                return None
+            if row["status"] == "pending":
+                cursor = connection.execute(
+                    """
+                    UPDATE job_runs
+                    SET status = 'running',
+                        started_at = COALESCE(started_at, ?),
+                        finished_at = NULL,
+                        error_text = NULL
+                    WHERE id = ?
+                      AND status = 'pending'
+                    """,
+                    (timestamp, row["id"]),
+                )
+                if cursor.rowcount == 0:
+                    return None
+        return self.get_job_run(int(row["id"]))
+
+    def complete_job_run(self, *, run_id: int, result: dict[str, object] | None = None) -> None:
+        timestamp = _utc_now_iso()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE job_runs
+                SET status = 'completed',
+                    result_json = ?,
+                    error_text = NULL,
+                    finished_at = ?
+                WHERE id = ?
+                """,
+                (json.dumps(result) if result is not None else None, timestamp, run_id),
+            )
+
+    def fail_job_run(self, *, run_id: int, error_text: str, result: dict[str, object] | None = None) -> None:
+        timestamp = _utc_now_iso()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE job_runs
+                SET status = 'failed',
+                    error_text = ?,
+                    finished_at = ?,
+                    result_json = ?
+                WHERE id = ?
+                """,
+                (error_text, timestamp, json.dumps(result) if result is not None else None, run_id),
+            )
+
+    def get_current_or_latest_running_job_check_batch(self) -> JobCheckBatchRun | None:
+        with self._connect() as connection:
+            batch_row = connection.execute(
+                """
+                SELECT
+                    id,
+                    mode,
+                    status,
+                    total_jobs,
+                    completed_jobs,
+                    failed_jobs,
+                    created_at,
+                    updated_at,
+                    last_error
+                FROM job_check_batches
+                WHERE status = 'running'
+                ORDER BY created_at ASC, id ASC
+                LIMIT 1
+                """
+            ).fetchone()
+            if batch_row is None:
+                return None
+            item_rows = connection.execute(
+                """
+                SELECT
+                    id,
+                    batch_id,
+                    job_id,
+                    status,
+                    error_message,
+                    updated_at
+                FROM job_check_batch_items
+                WHERE batch_id = ?
+                ORDER BY id ASC
+                """,
+                (batch_row["id"],),
+            ).fetchall()
+        return self._row_to_job_check_batch(batch_row, item_rows)
+
     def create_job_check_batch(self, *, mode: str, job_ids: list[int]) -> JobCheckBatchRun:
         timestamp = _utc_now_iso()
         with self._connect() as connection:
@@ -2856,6 +3076,10 @@ class SQLiteJobStore:
             )
             connection.execute(
                 "DELETE FROM generated_cvs WHERE job_id = ?",
+                (job_id,),
+            )
+            connection.execute(
+                "DELETE FROM job_runs WHERE target_job_id = ?",
                 (job_id,),
             )
             connection.execute(
@@ -3107,6 +3331,21 @@ class SQLiteJobStore:
             summary=row["summary"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _row_to_job_run(row: sqlite3.Row) -> JobRun:
+        return JobRun(
+            id=row["id"],
+            job_type=row["job_type"],
+            target_job_id=row["target_job_id"],
+            status=row["status"],
+            payload_json=row["payload_json"],
+            result_json=row["result_json"],
+            error_text=row["error_text"],
+            created_at=row["created_at"],
+            started_at=row["started_at"],
+            finished_at=row["finished_at"],
         )
 
     @staticmethod

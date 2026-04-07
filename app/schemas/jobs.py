@@ -64,6 +64,22 @@ class GeneratedCvArtifact(BaseModel):
     updated_at: str
 
 
+JobRunStatus = Literal["pending", "running", "completed", "failed"]
+
+
+class JobRun(BaseModel):
+    id: int
+    job_type: str
+    target_job_id: int | None = None
+    status: JobRunStatus
+    payload_json: str
+    result_json: str | None = None
+    error_text: str | None = None
+    created_at: str
+    started_at: str | None = None
+    finished_at: str | None = None
+
+
 class JobListItem(StoredJob):
     latest_snapshot: LatestJobSnapshot | None = None
     latest_candidate_compatibility_check: CandidateCompatibilityCheckResult | None = None

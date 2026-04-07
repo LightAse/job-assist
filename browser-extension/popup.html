@@ -10,6 +10,11 @@
     <main class="popup">
       <h1>Job Assist</h1>
       <p class="subtitle">Capture the current job page into the backend.</p>
+      <label class="field-label" for="backend-base-url">Backend URL</label>
+      <div class="backend-config">
+        <input id="backend-base-url" type="url" spellcheck="false" placeholder="http://100.x.y.z:8000">
+        <button id="save-settings-button" type="button" class="secondary">Save URL</button>
+      </div>
       <div class="actions">
         <button id="capture-button" type="button">Capture Job</button>
         <button id="capture-visible-button" type="button" class="secondary">Capture Visible Jobs</button>

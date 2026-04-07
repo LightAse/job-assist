@@ -1,5 +1,7 @@
+import json
 import logging
 import threading
+import time
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import FileResponse, Response
@@ -29,12 +31,12 @@ from app.services.compatibility_errors import (
 
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
-_candidate_compatibility_jobs_in_progress: set[int] = set()
-_job_cv_generation_jobs_in_progress: set[int] = set()
 logger = logging.getLogger(__name__)
-_job_check_batch_lock = threading.Lock()
-_active_job_check_batch_id: int | None = None
-_active_job_check_batch_thread: threading.Thread | None = None
+_job_worker_lock = threading.Lock()
+_job_worker_threads: dict[str, threading.Thread] = {}
+
+_JOB_RUN_TYPE_CANDIDATE_COMPATIBILITY = "candidate_compatibility_check"
+_JOB_RUN_TYPE_GENERATE_CV = "generate_cv"
 
 _OPENROUTER_PRIVACY_ERROR_PATTERNS = (
     "no endpoints available matching your guardrail restrictions and data policy",
@@ -111,21 +113,43 @@ def _is_systemic_provider_failure(detail: str) -> bool:
     return "provider" in normalized or "openrouter" in normalized or "privacy/data policy" in normalized
 
 
-def _finalize_active_batch(batch_id: int | None) -> None:
-    global _active_job_check_batch_id, _active_job_check_batch_thread
-    with _job_check_batch_lock:
-        if _active_job_check_batch_id == batch_id:
-            _active_job_check_batch_id = None
-            _active_job_check_batch_thread = None
+def _generate_job_cv_for_job(*, job_id: int, job_store: SQLiteJobStore):
+    job = job_store.get_job_detail(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Job not found.",
+        )
+    try:
+        return get_job_cv_generation_service().generate_cv(job=job, job_store=job_store)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(error),
+        ) from error
+    except CompatibilityProviderConfigurationError as error:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(error),
+        ) from error
+    except CompatibilityProviderTimeoutError as error:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="CV generation timed out.",
+        ) from error
+    except CompatibilityProviderResponseError as error:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=str(error),
+        ) from error
+    except CompatibilityProviderRequestError as error:
+        raise _build_provider_request_http_error(error) from error
 
 
-def _run_job_check_batch_worker(*, database_path: str, batch_id: int) -> None:
-    job_store = SQLiteJobStore(database_path)
+def _process_job_check_batch(*, batch_id: int, job_store: SQLiteJobStore) -> None:
     batch = job_store.get_job_check_batch(batch_id)
     if batch is None:
-        _finalize_active_batch(batch_id)
         return
-
     consecutive_failure_count = 0
     consecutive_failure_detail: str | None = None
     final_status = "completed"
@@ -133,8 +157,9 @@ def _run_job_check_batch_worker(*, database_path: str, batch_id: int) -> None:
 
     try:
         for item in batch.items:
+            if item.status in {"completed", "failed", "skipped"}:
+                continue
             job_store.update_job_check_batch_item(batch_id=batch_id, job_id=item.job_id, status_value="running")
-            _candidate_compatibility_jobs_in_progress.add(item.job_id)
             try:
                 _evaluate_candidate_compatibility_for_job(job_id=item.job_id, job_store=job_store)
                 job_store.update_job_check_batch_item(batch_id=batch_id, job_id=item.job_id, status_value="completed")
@@ -161,14 +186,132 @@ def _run_job_check_batch_worker(*, database_path: str, batch_id: int) -> None:
                 else:
                     consecutive_failure_count = 0
                     consecutive_failure_detail = None
-            finally:
-                _candidate_compatibility_jobs_in_progress.discard(item.job_id)
         job_store.complete_job_check_batch(batch_id=batch_id, status_value=final_status, last_error=last_error)
     except Exception as error:  # pragma: no cover - defensive guard for worker
         logger.exception("Job check batch worker crashed for batch %s", batch_id)
         job_store.complete_job_check_batch(batch_id=batch_id, status_value="failed", last_error=str(error))
+
+
+def _process_job_run(run_id: int, *, job_store: SQLiteJobStore) -> None:
+    run = job_store.start_job_run(run_id)
+    if run is None:
+        return
+
+    try:
+        payload = json.loads(run.payload_json)
+        job_id = int(payload["job_id"])
+        if run.job_type == _JOB_RUN_TYPE_CANDIDATE_COMPATIBILITY:
+            compatibility_check = _evaluate_candidate_compatibility_for_job(job_id=job_id, job_store=job_store)
+            job_store.complete_job_run(
+                run_id=run.id,
+                result={"compatibility_check_id": compatibility_check.id},
+            )
+            return
+        if run.job_type == _JOB_RUN_TYPE_GENERATE_CV:
+            artifact = _generate_job_cv_for_job(job_id=job_id, job_store=job_store)
+            job_store.complete_job_run(
+                run_id=run.id,
+                result={"artifact_id": artifact.id},
+            )
+            return
+        job_store.fail_job_run(
+            run_id=run.id,
+            error_text=f"Unsupported job run type: {run.job_type}",
+            result={"status_code": status.HTTP_500_INTERNAL_SERVER_ERROR, "detail": f"Unsupported job run type: {run.job_type}"},
+        )
+    except HTTPException as error:
+        job_store.fail_job_run(
+            run_id=run.id,
+            error_text=str(error.detail),
+            result={"status_code": error.status_code, "detail": error.detail},
+        )
+    except Exception as error:  # pragma: no cover - defensive guard for worker
+        logger.exception("Job worker crashed while processing run %s", run.id)
+        job_store.fail_job_run(
+            run_id=run.id,
+            error_text=str(error),
+            result={"status_code": status.HTTP_500_INTERNAL_SERVER_ERROR, "detail": "Job worker crashed."},
+        )
+
+
+def _job_worker_loop(*, database_path: str) -> None:
+    job_store = SQLiteJobStore(database_path)
+    try:
+        while True:
+            batch = job_store.get_current_or_latest_running_job_check_batch()
+            if batch is not None:
+                _process_job_check_batch(batch_id=batch.id, job_store=job_store)
+                continue
+
+            run = job_store.claim_next_pending_job_run()
+            if run is not None:
+                _process_job_run(run.id, job_store=job_store)
+                continue
+
+            return
     finally:
-        _finalize_active_batch(batch_id)
+        with _job_worker_lock:
+            worker = _job_worker_threads.get(database_path)
+            if worker is threading.current_thread():
+                _job_worker_threads.pop(database_path, None)
+
+
+def _ensure_job_worker_started(*, database_path: str) -> None:
+    with _job_worker_lock:
+        worker = _job_worker_threads.get(database_path)
+        if worker is not None and worker.is_alive():
+            return
+        _job_worker_threads[database_path] = threading.Thread(
+            target=_job_worker_loop,
+            kwargs={"database_path": database_path},
+            daemon=True,
+            name="job-execution-worker",
+        )
+        _job_worker_threads[database_path].start()
+
+
+def _wait_for_job_run_completion(*, run_id: int, job_store: SQLiteJobStore):
+    database_path = str(job_store.database_path)
+    while True:
+        run = job_store.get_job_run(run_id)
+        if run is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Job run disappeared before completion.",
+            )
+        if run.status == "completed":
+            return run
+        if run.status == "failed":
+            error_detail = run.error_text or "Job execution failed."
+            error_status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+            if run.result_json:
+                try:
+                    result = json.loads(run.result_json)
+                except json.JSONDecodeError:
+                    result = None
+                if isinstance(result, dict):
+                    error_detail = str(result.get("detail") or error_detail)
+                    if isinstance(result.get("status_code"), int):
+                        error_status_code = result["status_code"]
+            raise HTTPException(status_code=error_status_code, detail=error_detail)
+
+        with _job_worker_lock:
+            worker = _job_worker_threads.get(database_path)
+            worker_alive = worker is not None and worker.is_alive()
+        if not worker_alive:
+            job_store.fail_job_run(
+                run_id=run.id,
+                error_text="Job worker stopped before completion.",
+                result={
+                    "status_code": status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    "detail": "Job worker stopped before completion.",
+                },
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Job worker stopped before completion.",
+            )
+        time.sleep(0.05)
 
 
 @router.get("", response_model=list[JobListItem])
@@ -181,50 +324,28 @@ def start_job_check_batch(
     payload: StartJobCheckBatchRequest,
     job_store: SQLiteJobStore = Depends(get_job_store),
 ) -> JobCheckBatchRun:
-    global _active_job_check_batch_id, _active_job_check_batch_thread
-    with _job_check_batch_lock:
-        if _active_job_check_batch_id is not None:
-            active_batch = job_store.get_job_check_batch(_active_job_check_batch_id)
-            if active_batch is not None and active_batch.status == "running":
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="A job compatibility batch is already running.",
-                )
-            _active_job_check_batch_id = None
-            _active_job_check_batch_thread = None
-
-        jobs = job_store.list_jobs()
-        if payload.mode == "unscored":
-            jobs = [job for job in jobs if job.latest_candidate_compatibility_check is None]
-        job_ids = [job.id for job in jobs]
-        batch = job_store.create_job_check_batch(mode=payload.mode, job_ids=job_ids)
-        worker = threading.Thread(
-            target=_run_job_check_batch_worker,
-            kwargs={"database_path": str(job_store.database_path), "batch_id": batch.id},
-            daemon=True,
-            name=f"job-check-batch-{batch.id}",
+    active_batch = job_store.get_current_or_latest_running_job_check_batch()
+    if active_batch is not None:
+        _ensure_job_worker_started(database_path=str(job_store.database_path))
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A job compatibility batch is already running.",
         )
-        _active_job_check_batch_id = batch.id
-        _active_job_check_batch_thread = worker
-        worker.start()
-        return batch
+
+    jobs = job_store.list_jobs()
+    if payload.mode == "unscored":
+        jobs = [job for job in jobs if job.latest_candidate_compatibility_check is None]
+    job_ids = [job.id for job in jobs]
+    batch = job_store.create_job_check_batch(mode=payload.mode, job_ids=job_ids)
+    _ensure_job_worker_started(database_path=str(job_store.database_path))
+    return batch
 
 
 @router.get("/check-batch/current", response_model=JobCheckBatchRun | None)
 def get_current_job_check_batch(job_store: SQLiteJobStore = Depends(get_job_store)) -> JobCheckBatchRun | None:
     batch = job_store.get_current_or_latest_job_check_batch()
-    global _active_job_check_batch_id, _active_job_check_batch_thread
     if batch is not None and batch.status == "running":
-        with _job_check_batch_lock:
-            if _active_job_check_batch_id != batch.id or _active_job_check_batch_thread is None or not _active_job_check_batch_thread.is_alive():
-                job_store.complete_job_check_batch(
-                    batch_id=batch.id,
-                    status_value="failed",
-                    last_error="Batch worker stopped before completion.",
-                )
-                _active_job_check_batch_id = None
-                _active_job_check_batch_thread = None
-                batch = job_store.get_job_check_batch(batch.id)
+        _ensure_job_worker_started(database_path=str(job_store.database_path))
     return batch
 
 
@@ -337,20 +458,37 @@ def run_candidate_compatibility_check(
     job_id: int,
     job_store: SQLiteJobStore = Depends(get_job_store),
 ) -> RunCandidateCompatibilityCheckResponse:
-    if job_id in _candidate_compatibility_jobs_in_progress:
+    existing_run = job_store.find_active_job_run(
+        job_type=_JOB_RUN_TYPE_CANDIDATE_COMPATIBILITY,
+        target_job_id=job_id,
+    )
+    if existing_run is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="A compatibility check is already running for this job.",
         )
-    _candidate_compatibility_jobs_in_progress.add(job_id)
-    try:
-        compatibility_check = _evaluate_candidate_compatibility_for_job(job_id=job_id, job_store=job_store)
-        return RunCandidateCompatibilityCheckResponse(
-            job_id=job_id,
-            compatibility_check=compatibility_check,
+    run = job_store.create_job_run(
+        job_type=_JOB_RUN_TYPE_CANDIDATE_COMPATIBILITY,
+        payload={"job_id": job_id},
+        target_job_id=job_id,
+    )
+    _ensure_job_worker_started(database_path=str(job_store.database_path))
+    completed_run = _wait_for_job_run_completion(run_id=run.id, job_store=job_store)
+    result = json.loads(completed_run.result_json or "{}")
+    compatibility_check_id = result.get("compatibility_check_id")
+    compatibility_check = None
+    job = job_store.get_job_detail(job_id)
+    if job is not None and job.latest_candidate_compatibility_check is not None:
+        compatibility_check = job.latest_candidate_compatibility_check
+    if compatibility_check is None or compatibility_check.id != compatibility_check_id:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Candidate compatibility check completed without a persisted result.",
         )
-    finally:
-        _candidate_compatibility_jobs_in_progress.discard(job_id)
+    return RunCandidateCompatibilityCheckResponse(
+        job_id=job_id,
+        compatibility_check=compatibility_check,
+    )
 
 
 @router.post("/{job_id}/generate-cv", response_model=GenerateJobCvResponse)
@@ -358,47 +496,36 @@ def generate_job_cv(
     job_id: int,
     job_store: SQLiteJobStore = Depends(get_job_store),
 ) -> GenerateJobCvResponse:
-    if job_id in _job_cv_generation_jobs_in_progress:
+    existing_run = job_store.find_active_job_run(
+        job_type=_JOB_RUN_TYPE_GENERATE_CV,
+        target_job_id=job_id,
+    )
+    if existing_run is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="CV generation is already running for this job.",
         )
-
-    job = job_store.get_job_detail(job_id)
-    if job is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Job not found.",
-        )
-
-    _job_cv_generation_jobs_in_progress.add(job_id)
-    try:
-        artifact = get_job_cv_generation_service().generate_cv(job=job, job_store=job_store)
-        return GenerateJobCvResponse(job_id=job_id, artifact=artifact)
-    except ValueError as error:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(error),
-        ) from error
-    except CompatibilityProviderConfigurationError as error:
+    run = job_store.create_job_run(
+        job_type=_JOB_RUN_TYPE_GENERATE_CV,
+        payload={"job_id": job_id},
+        target_job_id=job_id,
+    )
+    _ensure_job_worker_started(database_path=str(job_store.database_path))
+    completed_run = _wait_for_job_run_completion(run_id=run.id, job_store=job_store)
+    result = json.loads(completed_run.result_json or "{}")
+    artifact_id = result.get("artifact_id")
+    if not isinstance(artifact_id, int):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(error),
-        ) from error
-    except CompatibilityProviderTimeoutError as error:
+            detail="CV generation completed without a persisted artifact.",
+        )
+    artifact = job_store.get_generated_cv_artifact(artifact_id)
+    if artifact is None:
         raise HTTPException(
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail="CV generation timed out.",
-        ) from error
-    except CompatibilityProviderResponseError as error:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=str(error),
-        ) from error
-    except CompatibilityProviderRequestError as error:
-        raise _build_provider_request_http_error(error) from error
-    finally:
-        _job_cv_generation_jobs_in_progress.discard(job_id)
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="CV generation completed without a persisted artifact.",
+        )
+    return GenerateJobCvResponse(job_id=job_id, artifact=artifact)
 
 
 @router.get("/generated-cvs/{artifact_id}/download")

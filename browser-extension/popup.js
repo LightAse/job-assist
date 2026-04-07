@@ -1,8 +1,50 @@
-const API_URL = "http://127.0.0.1:8000/plugins/scrape-current";
+const DEFAULT_BACKEND_BASE_URL = "http://127.0.0.1:8000";
+const BACKEND_BASE_URL_STORAGE_KEY = "jobAssistBackendBaseUrl";
 
 const button = document.getElementById("capture-button");
 const captureVisibleButton = document.getElementById("capture-visible-button");
+const saveSettingsButton = document.getElementById("save-settings-button");
+const backendBaseUrlInput = document.getElementById("backend-base-url");
 const statusNode = document.getElementById("status");
+
+function normalizeBackendBaseUrl(value) {
+  const normalized = String(value || "").trim().replace(/\/+$/, "");
+  if (!normalized) {
+    throw new Error("Backend URL is required.");
+  }
+  const parsed = new URL(normalized);
+  if (!/^https?:$/.test(parsed.protocol)) {
+    throw new Error("Backend URL must start with http:// or https://");
+  }
+  return parsed.toString().replace(/\/+$/, "");
+}
+
+function getStorageArea() {
+  return chrome.storage?.sync || chrome.storage?.local;
+}
+
+async function getBackendBaseUrl() {
+  const storage = getStorageArea();
+  if (!storage) {
+    return DEFAULT_BACKEND_BASE_URL;
+  }
+  const stored = await storage.get(BACKEND_BASE_URL_STORAGE_KEY);
+  return stored[BACKEND_BASE_URL_STORAGE_KEY] || DEFAULT_BACKEND_BASE_URL;
+}
+
+async function saveBackendBaseUrl() {
+  const storage = getStorageArea();
+  const backendBaseUrl = normalizeBackendBaseUrl(backendBaseUrlInput.value);
+  if (storage) {
+    await storage.set({ [BACKEND_BASE_URL_STORAGE_KEY]: backendBaseUrl });
+  }
+  backendBaseUrlInput.value = backendBaseUrl;
+  return backendBaseUrl;
+}
+
+async function loadSettings() {
+  backendBaseUrlInput.value = await getBackendBaseUrl();
+}
 
 function setStatus(message, state) {
   statusNode.textContent = message;
@@ -192,7 +234,8 @@ async function captureVisibleLinkedInJob(tabId, target) {
 }
 
 async function submitCapture(payload) {
-  const response = await fetch(API_URL, {
+  const backendBaseUrl = await getBackendBaseUrl();
+  const response = await fetch(`${backendBaseUrl}/plugins/scrape-current`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -208,6 +251,15 @@ async function submitCapture(payload) {
 
   return body;
 }
+
+saveSettingsButton.addEventListener("click", async () => {
+  try {
+    const backendBaseUrl = await saveBackendBaseUrl();
+    setStatus(`Saved backend URL:\n${backendBaseUrl}`, "success");
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : "Could not save backend URL.", "error");
+  }
+});
 
 async function captureCurrentTab() {
   const tab = await getActiveTab();
@@ -410,4 +462,8 @@ captureVisibleButton.addEventListener("click", async () => {
   } finally {
     setBusy(false);
   }
+});
+
+loadSettings().catch(() => {
+  backendBaseUrlInput.value = DEFAULT_BACKEND_BASE_URL;
 });
