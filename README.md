@@ -1,5 +1,7 @@
 # Job Assist
 
+This project is still in active development. Expect rough edges, missing polish, and changes to setup or behavior as features are still being built out.
+
 Job Assist is a small FastAPI app for saving job posts, reviewing them in a browser UI, and generating resume-related outputs from your own candidate data.
 
 It has three main pieces:
