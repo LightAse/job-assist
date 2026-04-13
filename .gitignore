@@ -1,49 +1,71 @@
-# Python
+# =========================
+# 🐍 Python
+# =========================
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
 *.pyd
 
-# Virtual environments
+# =========================
+# 🧠 Virtual environments
+# =========================
 .venv/
 venv/
 env/
 
-# Environment variables
+# =========================
+# 🔐 Environment variables
+# =========================
 .env
+.env.*
 
-# SQLite / local databases
+# =========================
+# 🗄️ Databases / local data
+# =========================
 *.db
 *.sqlite
 *.sqlite3
-
-# Project data (tu carpeta data)
 data/
 
-# Logs
-*.log
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# IDEs
-.vscode/
-.idea/
-
-# Testing / cache
+# =========================
+# 🧪 Testing / coverage
+# =========================
 .pytest_cache/
 .coverage
+.coverage.*
+htmlcov/
 
-# Build / packaging
+# =========================
+# 📦 Build / packaging
+# =========================
 dist/
 build/
 *.egg-info/
 
+# =========================
+# 🧰 Tooling caches
+# =========================
+.mypy_cache/
+.ruff_cache/
+.pyre/
 
-__pycache__/
-*.pyc
-.venv/
-data/
-.env
-.pytest_cache/
+# =========================
+# 📝 Logs
+# =========================
+*.log
+
+# =========================
+# 💻 IDEs / editors
+# =========================
+.vscode/
+.idea/
+
+# =========================
+# 🧱 OS files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# ⚙️ Local tools / configs
+# =========================
+.codex/
