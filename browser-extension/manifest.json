@@ -3,12 +3,18 @@
   "name": "Job Assist Capture",
   "version": "0.1.0",
   "description": "Capture the current tab as a potential job posting.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "job-assist-capture@job-assist.local"
+    }
+  },
   "action": {
     "default_title": "Job Assist Capture",
     "default_popup": "popup.html"
   },
   "permissions": [
     "activeTab",
+    "scripting",
     "tabs",
     "storage"
   ],

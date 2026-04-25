@@ -28,15 +28,30 @@ async function getBackendBaseUrl() {
   if (!storage) {
     return DEFAULT_BACKEND_BASE_URL;
   }
-  const stored = await storage.get(BACKEND_BASE_URL_STORAGE_KEY);
-  return stored[BACKEND_BASE_URL_STORAGE_KEY] || DEFAULT_BACKEND_BASE_URL;
+  try {
+    const stored = await storage.get(BACKEND_BASE_URL_STORAGE_KEY);
+    return stored[BACKEND_BASE_URL_STORAGE_KEY] || DEFAULT_BACKEND_BASE_URL;
+  } catch (error) {
+    console.warn("[Job Assist][Popup] Storage unavailable while reading backend URL; using default.", {
+      error,
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return DEFAULT_BACKEND_BASE_URL;
+  }
 }
 
 async function saveBackendBaseUrl() {
   const storage = getStorageArea();
   const backendBaseUrl = normalizeBackendBaseUrl(backendBaseUrlInput.value);
   if (storage) {
-    await storage.set({ [BACKEND_BASE_URL_STORAGE_KEY]: backendBaseUrl });
+    try {
+      await storage.set({ [BACKEND_BASE_URL_STORAGE_KEY]: backendBaseUrl });
+    } catch (error) {
+      console.warn("[Job Assist][Popup] Storage unavailable while saving backend URL.", {
+        error,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
   backendBaseUrlInput.value = backendBaseUrl;
   return backendBaseUrl;
@@ -49,6 +64,14 @@ async function loadSettings() {
 function setStatus(message, state) {
   statusNode.textContent = message;
   statusNode.dataset.state = state || "";
+}
+
+function logDebug(message, details) {
+  if (details === undefined) {
+    console.debug("[Job Assist][Popup]", message);
+    return;
+  }
+  console.debug("[Job Assist][Popup]", message, details);
 }
 
 function setBusy(isBusy) {
@@ -67,6 +90,16 @@ function withSizeCap(value, maxLength) {
 }
 
 function buildPayload(tab, extraction) {
+  logDebug("Building capture payload.", {
+    tabUrl: tab?.url || null,
+    extractionUrl: extraction?.url || null,
+    extractionTitle: extraction?.title || null,
+    extractionCompany: extraction?.company || null,
+    extractionLocation: extraction?.location || null,
+    extractionLinkedInJobId: extraction?.linkedinJobId || null,
+    hasHtml: Boolean(extraction?.html),
+    hasVisibleText: Boolean(extraction?.visibleText),
+  });
   return {
     url: extraction.url || tab.url,
     title: extraction.title || tab.title || null,
@@ -83,8 +116,63 @@ async function getActiveTab() {
   return tabs[0] || null;
 }
 
+function isMissingContentScriptError(error) {
+  const message = error instanceof Error ? error.message : String(error || "");
+  return (
+    message.includes("Could not establish connection") ||
+    message.includes("Receiving end does not exist")
+  );
+}
+
+async function ensureContentScriptInjected(tabId) {
+  if (!chrome.scripting?.executeScript) {
+    throw new Error("The extension cannot inject its content script in this browser.");
+  }
+
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: ["content-script.js"],
+  });
+}
+
+async function sendTabMessage(tabId, message) {
+  logDebug("Sending message to tab.", { tabId, type: message?.type || null });
+  try {
+    const response = await chrome.tabs.sendMessage(tabId, message);
+    logDebug("Received tab response.", {
+      tabId,
+      type: message?.type || null,
+      ok: response?.ok ?? null,
+      hasPayload: Boolean(response?.payload),
+      error: response?.error || null,
+    });
+    return response;
+  } catch (error) {
+    if (!isMissingContentScriptError(error)) {
+      console.error("[Job Assist][Popup] Tab message failed.", {
+        tabId,
+        type: message?.type || null,
+        error,
+      });
+      throw error;
+    }
+
+    logDebug("Content script missing; injecting and retrying.", { tabId });
+    await ensureContentScriptInjected(tabId);
+    const response = await chrome.tabs.sendMessage(tabId, message);
+    logDebug("Received tab response after injection.", {
+      tabId,
+      type: message?.type || null,
+      ok: response?.ok ?? null,
+      hasPayload: Boolean(response?.payload),
+      error: response?.error || null,
+    });
+    return response;
+  }
+}
+
 async function extractFromTab(tabId) {
-  const response = await chrome.tabs.sendMessage(tabId, { type: "CAPTURE_JOB_PAGE" });
+  const response = await sendTabMessage(tabId, { type: "CAPTURE_JOB_PAGE" });
   if (!response || !response.ok) {
     const detail = response && response.error ? response.error : "No extraction response received.";
     throw new Error(detail);
@@ -93,7 +181,7 @@ async function extractFromTab(tabId) {
 }
 
 async function listVisibleLinkedInJobs(tabId) {
-  const response = await chrome.tabs.sendMessage(tabId, { type: "LIST_VISIBLE_LINKEDIN_JOBS" });
+  const response = await sendTabMessage(tabId, { type: "LIST_VISIBLE_LINKEDIN_JOBS" });
   if (!response || !response.ok) {
     const detail = response && response.error ? response.error : "No visible LinkedIn jobs found.";
     throw new Error(detail);
@@ -211,7 +299,7 @@ async function listVisibleLinkedInJobsWithRetry(tabId, options = {}) {
 }
 
 async function scrollLinkedInJobRail(tabId) {
-  const response = await chrome.tabs.sendMessage(tabId, { type: "SCROLL_LINKEDIN_JOB_RAIL" });
+  const response = await sendTabMessage(tabId, { type: "SCROLL_LINKEDIN_JOB_RAIL" });
   if (!response || !response.ok) {
     const detail = response && response.error ? response.error : "Could not scroll the LinkedIn jobs rail.";
     throw new Error(detail);
@@ -221,7 +309,7 @@ async function scrollLinkedInJobRail(tabId) {
 }
 
 async function captureVisibleLinkedInJob(tabId, target) {
-  const response = await chrome.tabs.sendMessage(tabId, {
+  const response = await sendTabMessage(tabId, {
     type: "CAPTURE_LINKEDIN_VISIBLE_JOB",
     payload: target,
   });
@@ -234,22 +322,55 @@ async function captureVisibleLinkedInJob(tabId, target) {
 }
 
 async function submitCapture(payload) {
-  const backendBaseUrl = await getBackendBaseUrl();
-  const response = await fetch(`${backendBaseUrl}/plugins/scrape-current`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
+  logDebug("submitCapture entered.", {
+    payloadUrl: payload?.url || null,
+    payloadTitle: payload?.title || null,
+    payloadLinkedInJobId: payload?.linkedin_job_id || null,
   });
 
-  const body = await response.json().catch(() => null);
-  if (!response.ok) {
-    const detail = body && body.detail ? body.detail : `Request failed with status ${response.status}.`;
-    throw new Error(detail);
-  }
+  try {
+    const backendBaseUrl = await getBackendBaseUrl();
+    logDebug("Resolved backend base URL.", { backendBaseUrl });
 
-  return body;
+    const requestUrl = `${backendBaseUrl}/plugins/scrape-current`;
+    logDebug("Submitting capture.", {
+      requestUrl,
+      url: payload?.url || null,
+      title: payload?.title || null,
+      linkedinJobId: payload?.linkedin_job_id || null,
+      hasHtml: Boolean(payload?.html),
+      hasVisibleText: Boolean(payload?.visible_text),
+    });
+
+    const response = await fetch(requestUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const body = await response.json().catch(() => null);
+    logDebug("Capture response received.", {
+      requestUrl,
+      status: response.status,
+      ok: response.ok,
+      body,
+    });
+    if (!response.ok) {
+      const detail = body && body.detail ? body.detail : `Request failed with status ${response.status}.`;
+      throw new Error(detail);
+    }
+
+    return body;
+  } catch (error) {
+    console.error("[Job Assist][Popup] submitCapture failed.", {
+      error,
+      message: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : null,
+    });
+    throw error;
+  }
 }
 
 saveSettingsButton.addEventListener("click", async () => {
@@ -269,6 +390,7 @@ async function captureCurrentTab() {
 
   const extraction = await extractFromTab(tab.id);
   const payload = buildPayload(tab, extraction);
+  logDebug("Current-tab payload built.", payload);
   return submitCapture(payload);
 }
 
@@ -369,10 +491,26 @@ async function captureVisibleJobs() {
 
       try {
         const extraction = await captureVisibleLinkedInJob(tab.id, job);
+        logDebug("Captured visible LinkedIn job.", {
+          batchKey: job.batchKey,
+          title: job.title || null,
+          linkedinJobId: job.linkedinJobId || null,
+          extraction,
+        });
         const payload = buildPayload(tab, extraction);
+        logDebug("Visible-job payload built.", {
+          batchKey: job.batchKey,
+          payload,
+        });
         await submitCapture(payload);
         progress.created += 1;
-      } catch (_error) {
+      } catch (error) {
+        console.error("[Job Assist][Popup] Visible-job capture failed.", {
+          batchKey: job.batchKey,
+          title: job.title || null,
+          linkedinJobId: job.linkedinJobId || null,
+          error,
+        });
         progress.failed += 1;
       } finally {
         processedKeys.add(job.batchKey);
