@@ -35,6 +35,25 @@ def test_scrape_current_returns_linkedin_plugin_response(temp_job_store: SQLiteJ
     }
 
 
+def test_scrape_current_returns_linkedin_plugin_response_for_search_results_current_job(temp_job_store: SQLiteJobStore) -> None:
+    response = scrape_current(
+        ScrapeCurrentRequest(
+            url="https://www.linkedin.com/jobs/search-results/?currentJobId=1234567890",
+            title="Senior Backend Engineer",
+            company="Example Co",
+            visible_text="Senior Backend Engineer at Example Co",
+            linkedin_job_id="1234567890",
+        ),
+        job_store=temp_job_store,
+    )
+
+    assert response.plugin_name == "linkedin_job_scraper"
+    assert response.status == "created"
+    assert response.deduplicated is False
+    assert response.structured_data["external_job_id"] == "1234567890"
+    assert response.structured_data["source"] == "linkedin"
+
+
 def test_scrape_current_returns_generic_plugin_response_for_non_matching_url(temp_job_store: SQLiteJobStore) -> None:
     response = scrape_current(
         ScrapeCurrentRequest(

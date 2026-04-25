@@ -1,7 +1,8 @@
+import logging
 import os
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -17,11 +18,13 @@ def _parse_csv_env(name: str, *, default: str = "") -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+logger = logging.getLogger(__name__)
+default_extension_origin_regex = r"^(chrome-extension|moz-extension):\/\/.*$"
 allowed_origins = _parse_csv_env(
     "JOB_ASSIST_CORS_ALLOWED_ORIGINS",
     default="http://localhost:8080,http://127.0.0.1:8080,http://localhost:8000,http://127.0.0.1:8000",
 )
-allowed_origin_regex = os.environ.get("JOB_ASSIST_CORS_ALLOWED_ORIGIN_REGEX", r"chrome-extension://.*")
+allowed_origin_regex = os.environ.get("JOB_ASSIST_CORS_ALLOWED_ORIGIN_REGEX", default_extension_origin_regex) or None
 
 app = FastAPI(title="Job Assist API")
 app.add_middleware(
@@ -31,6 +34,25 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def log_cors_origin_for_debugging(request: Request, call_next):
+    response = await call_next(request)
+    origin = request.headers.get("origin")
+    if origin and (request.method == "OPTIONS" or response.status_code >= 400):
+        logger.info(
+            "CORS debug: method=%s path=%s origin=%s status=%s allowed_origins=%s allowed_origin_regex=%s",
+            request.method,
+            request.url.path,
+            origin,
+            response.status_code,
+            allowed_origins,
+            allowed_origin_regex,
+        )
+    return response
+
+
 app.mount("/static", StaticFiles(directory=Path(__file__).resolve().parent / "static"), name="static")
 app.include_router(ui_router)
 app.include_router(jobs_router)

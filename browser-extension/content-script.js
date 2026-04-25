@@ -10,8 +10,11 @@
     "[data-entity-urn*='jobPosting']",
   ].join(", ");
   const LINKEDIN_DEBUG_PREFIX = "[Job Assist][LinkedIn Rail]";
+  const INVALID_EXTENSION_RESOURCE_URL = /^chrome-extension:\/\/invalid(?:\/|$)/i;
   let linkedInDebugRail = null;
   let linkedInDebugRailStyles = null;
+  let invalidExtensionResourceNoMatchLogged = false;
+  const loggedInvalidExtensionResourceReferences = new Set();
 
   function collapseWhitespace(value) {
     return value.replace(/\s+/g, " ").trim();
@@ -131,12 +134,15 @@
     }
   }
 
-  function detectLinkedInJobId(root = document) {
-    const urlId = parseLinkedInJobIdFromUrl(window.location.href);
-    if (urlId) {
-      return urlId;
-    }
+  function getLinkedInJobIdFromCurrentUrl() {
+    return parseLinkedInJobIdFromUrl(window.location.href);
+  }
 
+  function buildLinkedInCanonicalJobUrl(jobId) {
+    return jobId ? `https://www.linkedin.com/jobs/view/${jobId}/` : window.location.href;
+  }
+
+  function detectLinkedInJobId(root = document) {
     const selectors = [
       "[data-job-id]",
       "[data-entity-urn*='fsd_jobPosting:']",
@@ -163,7 +169,7 @@
       }
     }
 
-    return null;
+    return getLinkedInJobIdFromCurrentUrl();
   }
 
   function detectGreenhouseCompany() {
@@ -281,6 +287,7 @@
     }
     if (
       /^\/jobs\/(search|collections)\//.test(pathname) ||
+      /^\/jobs\/search-results\//.test(pathname) ||
       pathname === "/jobs/" ||
       searchParams.has("currentJobId")
     ) {
@@ -340,17 +347,20 @@
   }
 
   function extractLinkedInPayload() {
+    logInvalidExtensionResourceReferences();
+
     const pageKind = getLinkedInPageKind();
     const detailRoot = findLinkedInDetailRoot();
+    const currentJobId = getLinkedInJobIdFromCurrentUrl();
 
     if (pageKind === "listing" && !detailRoot) {
-      throw new Error("Open a single LinkedIn job detail before capturing.");
+      throw new Error("Select a LinkedIn job in the results page before capturing.");
     }
 
     const root = detailRoot || document.documentElement;
     const multipleJobCards = distinctLinkedInJobCardTitles(root);
-    if (multipleJobCards.length > 1) {
-      throw new Error("Open a single LinkedIn job detail before capturing.");
+    if (!detailRoot && multipleJobCards.length > 1) {
+      throw new Error("Select a single LinkedIn job detail before capturing.");
     }
 
     const title = firstContent([
@@ -377,16 +387,17 @@
     ]);
 
     if (!title || !company) {
-      throw new Error("Open a single LinkedIn job detail before capturing.");
+      throw new Error("The selected LinkedIn job detail is still loading. Try again after the detail pane finishes rendering.");
     }
 
+    const linkedinJobId = detectLinkedInJobId(root) || currentJobId;
     return {
       title,
-      url: window.location.href,
+      url: linkedinJobId ? buildLinkedInCanonicalJobUrl(linkedinJobId) : window.location.href,
       html: root.outerHTML,
       visibleText: normalizedVisibleText(root),
       sourceType: "linkedin",
-      linkedinJobId: detectLinkedInJobId(root),
+      linkedinJobId,
       company,
       location,
     };
@@ -411,6 +422,80 @@
       return;
     }
     console.debug(LINKEDIN_DEBUG_PREFIX, message, details);
+  }
+
+  function logInvalidExtensionResourceReferences() {
+    const selectors = [
+      "img[src]",
+      "iframe[src]",
+      "script[src]",
+      "source[src]",
+      "source[srcset]",
+      "video[src]",
+      "audio[src]",
+      "img[srcset]",
+      "link[href]",
+      "a[href]",
+      "use[href]",
+      "image[href]",
+    ];
+    const invalidReferences = [];
+
+    for (const selector of selectors) {
+      for (const element of document.querySelectorAll(selector)) {
+        const attribute = element.hasAttribute("src") ? "src" : element.hasAttribute("href") ? "href" : "srcset";
+        const value = element.getAttribute(attribute) || "";
+        if (!INVALID_EXTENSION_RESOURCE_URL.test(value)) {
+          continue;
+        }
+
+        const key = `${selector}|${value}|${describeElement(element)}`;
+        if (loggedInvalidExtensionResourceReferences.has(key)) {
+          continue;
+        }
+        loggedInvalidExtensionResourceReferences.add(key);
+
+        invalidReferences.push({
+          element: describeElement(element),
+          attribute,
+          value,
+        });
+      }
+    }
+
+    if (invalidReferences.length) {
+      console.warn("[Job Assist][Extension Resource]", "Found invalid extension resource references in page DOM.", {
+        invalidReferences,
+        runtimeId: chrome.runtime?.id || null,
+      });
+    } else if (!invalidExtensionResourceNoMatchLogged) {
+      invalidExtensionResourceNoMatchLogged = true;
+      console.debug("[Job Assist][Extension Resource]", "No invalid extension resource references found in page DOM.", {
+        runtimeId: chrome.runtime?.id || null,
+      });
+    }
+  }
+
+  function startInvalidExtensionResourceDiagnostics() {
+    if (detectSourceType(window.location.href) !== "linkedin") {
+      return;
+    }
+
+    logInvalidExtensionResourceReferences();
+    if (!window.MutationObserver || !document.documentElement) {
+      return;
+    }
+
+    const observer = new MutationObserver(() => {
+      logInvalidExtensionResourceReferences();
+    });
+    observer.observe(document.documentElement, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      attributeFilter: ["src", "href", "srcset"],
+    });
+    window.setTimeout(() => observer.disconnect(), 15000);
   }
 
   function describeElement(element) {
@@ -520,27 +605,106 @@
     return Array.from(new Set(elements.filter(Boolean)));
   }
 
-  function getLinkedInJobCards(root = document) {
+  function getLinkedInJobCardDiscovery(root = document, { log = false } = {}) {
+    const selectorMatches = [];
     const explicitSelectors = [
       ".jobs-search-results-list__list-item",
       ".scaffold-layout__list-item",
       ".job-card-container",
       "li[data-occludable-job-id]",
       "[data-job-id]",
+      "[data-occludable-job-id]",
+      "[data-entity-urn*='jobPosting']",
+      "[role='listitem']",
+      "li",
+      "article",
     ];
 
+    const cards = [];
     for (const selector of explicitSelectors) {
-      const cards = Array.from(root.querySelectorAll(selector)).filter((element) => {
+      const matched = Array.from(root.querySelectorAll(selector)).filter((element) => {
         return getLinkedInJobTargets(element).length > 0;
       });
-      if (cards.length) {
-        return uniqueElements(cards);
+      if (matched.length) {
+        selectorMatches.push({ selector, count: matched.length });
+        cards.push(...matched);
       }
     }
 
-    return uniqueElements(
-      getLinkedInJobTargets(root).map((target) => getLinkedInJobCardFromTarget(target, root))
-    ).filter((element) => root.contains(element));
+    const targets = getLinkedInJobTargets(root);
+    const targetCards = targets.map((target) => getLinkedInJobCardFromTarget(target, root));
+    if (targetCards.length) {
+      selectorMatches.push({ selector: LINKEDIN_JOB_TARGET_SELECTOR, count: targetCards.length });
+      cards.push(...targetCards);
+    }
+
+    const uniqueCards = uniqueElements(cards).filter((element) => root.contains(element));
+    if (log) {
+      logLinkedInRailDebug(`Detected ${uniqueCards.length} LinkedIn job card candidates.`, {
+        selectorMatches,
+        jobTargets: targets.length,
+      });
+    }
+
+    return {
+      cards: uniqueCards,
+      selectorMatches,
+      jobTargets: targets,
+    };
+  }
+
+  function getLinkedInJobCards(root = document) {
+    return getLinkedInJobCardDiscovery(root).cards;
+  }
+
+  function isLinkedInRailScrollContainer(element) {
+    if (!element || element === document.body || element === document.documentElement) {
+      return false;
+    }
+
+    const rect = element.getBoundingClientRect();
+    return (
+      rect.width > 140 &&
+      rect.height > 120 &&
+      rect.bottom > 0 &&
+      rect.top < window.innerHeight &&
+      element.scrollHeight > element.clientHeight + 20
+    );
+  }
+
+  function inferLinkedInRailFromCards(cards) {
+    const visibleCards = cards.filter((card) => isElementVisible(card));
+    const candidates = [];
+
+    for (const card of visibleCards) {
+      let current = card.parentElement;
+      while (current && current !== document.body && current !== document.documentElement) {
+        if (isLinkedInRailScrollContainer(current)) {
+          const containedVisibleCards = visibleCards.filter((candidateCard) => current.contains(candidateCard));
+          candidates.push({
+            element: current,
+            containedVisibleCards: containedVisibleCards.length,
+          });
+          break;
+        }
+        current = current.parentElement;
+      }
+    }
+
+    const uniqueCandidates = uniqueElements(candidates.map((candidate) => candidate.element)).map((element) => {
+      const containedVisibleCards = visibleCards.filter((card) => element.contains(card)).length;
+      const rect = element.getBoundingClientRect();
+      const leftish = rect.left < window.innerWidth * 0.55;
+      return {
+        element,
+        containedVisibleCards,
+        rect,
+        score: containedVisibleCards * 20 + Math.min(element.clientHeight, window.innerHeight) / 8 + (leftish ? 30 : 0),
+      };
+    });
+
+    uniqueCandidates.sort((left, right) => right.score - left.score);
+    return uniqueCandidates.find((candidate) => candidate.containedVisibleCards >= 2)?.element || null;
   }
 
   function buildLinkedInRailCandidate(element) {
@@ -604,6 +768,21 @@
   }
 
   function getLinkedInLeftRailContainer() {
+    const discovery = getLinkedInJobCardDiscovery(document, { log: true });
+    const inferredRail = inferLinkedInRailFromCards(discovery.cards);
+    if (inferredRail) {
+      highlightLinkedInRail(inferredRail);
+      const visibleCards = discovery.cards.filter((card) => inferredRail.contains(card) && isElementVisible(card));
+      logLinkedInRailDebug(`Inferred ${describeElement(inferredRail)} as rail from detected job cards.`, {
+        visibleJobCards: visibleCards.length,
+        totalDetectedCards: discovery.cards.length,
+        scrollHeight: inferredRail.scrollHeight,
+        clientHeight: inferredRail.clientHeight,
+      });
+      return inferredRail;
+    }
+
+    logLinkedInRailDebug("Could not infer rail from job card ancestors; falling back to container scoring.");
     const pool = Array.from(document.querySelectorAll("div, section, aside, ul, ol, main"));
     logLinkedInRailDebug(`Evaluating ${pool.length} candidate containers.`);
 
@@ -709,6 +888,8 @@
       throw new Error("Open LinkedIn jobs before using bulk capture.");
     }
 
+    logInvalidExtensionResourceReferences();
+
     const pageKind = getLinkedInPageKind();
     if (pageKind !== "listing") {
       throw new Error("Open a LinkedIn jobs listing with the visible jobs rail before using bulk capture.");
@@ -792,6 +973,51 @@
     );
   }
 
+  function isLinkedInJobCardSelected(card) {
+    if (!card) {
+      return false;
+    }
+
+    const selectedSelectors = [
+      "[aria-selected='true']",
+      "[aria-current='true']",
+      ".job-card-container--active",
+      ".jobs-search-results-list__list-item--active",
+      ".scaffold-layout__list-item--active",
+      ".artdeco-list__item--active",
+    ];
+
+    if (selectedSelectors.some((selector) => card.matches?.(selector) || card.querySelector?.(selector))) {
+      return true;
+    }
+
+    const className = typeof card.className === "string" ? card.className : "";
+    return /selected|active|current/i.test(className);
+  }
+
+  function activateLinkedInJobCard(card) {
+    const activator = findLinkedInJobCardActivator(card);
+    if (!activator?.click) {
+      throw new Error("Could not activate the requested LinkedIn job card.");
+    }
+
+    const preventFullPageNavigation = (event) => {
+      const link = event.target?.closest?.("a[href*='/jobs/view/']");
+      if (link && card.contains(link)) {
+        event.preventDefault();
+      }
+    };
+
+    document.addEventListener("click", preventFullPageNavigation, true);
+    try {
+      activator.click();
+    } finally {
+      window.setTimeout(() => {
+        document.removeEventListener("click", preventFullPageNavigation, true);
+      }, 0);
+    }
+  }
+
   function getLinkedInDetailSignature() {
     try {
       const payload = extractLinkedInPayload();
@@ -805,7 +1031,11 @@
     }
   }
 
-  function waitForLinkedInDetailUpdate(targetJobId, previousSignature, timeoutMs = 8000) {
+  function normalizeLinkedInTitle(value) {
+    return collapseWhitespace(value || "").toLowerCase();
+  }
+
+  function waitForLinkedInDetailUpdate(target, previousSignature, card, timeoutMs = 12000) {
     const startedAt = Date.now();
 
     return new Promise((resolve, reject) => {
@@ -823,16 +1053,25 @@
             title: payload.title,
             company: payload.company,
           });
-          const idMatches = !targetJobId || payload.linkedinJobId === targetJobId;
+          const urlJobId = getLinkedInJobIdFromCurrentUrl();
+          const titleMatches =
+            target.title &&
+            normalizeLinkedInTitle(payload.title) &&
+            normalizeLinkedInTitle(target.title).includes(normalizeLinkedInTitle(payload.title));
+          const idMatches =
+            !target.linkedinJobId ||
+            payload.linkedinJobId === target.linkedinJobId ||
+            urlJobId === target.linkedinJobId;
+          const selectedMatches = isLinkedInJobCardSelected(card);
           const changed = currentSignature !== previousSignature;
-          if (idMatches && changed) {
+          if (idMatches && (changed || titleMatches || selectedMatches)) {
             resolve(payload);
             return;
           }
         }
 
         if (Date.now() - startedAt >= timeoutMs) {
-          reject(new Error("Timed out waiting for the LinkedIn job detail panel to update."));
+          reject(new Error("Timed out waiting for LinkedIn to load the selected job detail. Try again, or capture the currently open job page."));
           return;
         }
 
@@ -863,10 +1102,9 @@
     card.scrollIntoView({ block: "center", behavior: "auto" });
 
     const previousSignature = getLinkedInDetailSignature();
-    const activator = findLinkedInJobCardActivator(card);
-    activator.click();
+    activateLinkedInJobCard(card);
 
-    return waitForLinkedInDetailUpdate(target.linkedinJobId, previousSignature);
+    return waitForLinkedInDetailUpdate(target, previousSignature, card);
   }
 
   function extractPayload() {
@@ -899,6 +1137,8 @@
       location,
     };
   }
+
+  startInvalidExtensionResourceDiagnostics();
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (!message || !message.type) {

@@ -1,4 +1,4 @@
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from app.plugins.base import JobScraperPlugin
 from app.schemas.scrape import ScrapeContext, ScrapeCurrentResponse
@@ -11,7 +11,9 @@ class LinkedInJobScraperPlugin(JobScraperPlugin):
 
     def matches(self, context: ScrapeContext) -> bool:
         parsed = urlparse(str(context.url))
-        return parsed.scheme in {"http", "https"} and parsed.netloc in self._supported_hosts and "/jobs/view/" in parsed.path
+        if parsed.scheme not in {"http", "https"} or parsed.netloc not in self._supported_hosts:
+            return False
+        return "/jobs/view/" in parsed.path or bool(context.linkedin_job_id) or bool(self._extract_job_id(str(context.url)))
 
     def scrape(self, context: ScrapeContext) -> ScrapeCurrentResponse:
         structured_data = {
@@ -34,7 +36,12 @@ class LinkedInJobScraperPlugin(JobScraperPlugin):
 
     @staticmethod
     def _extract_job_id(url: str) -> str | None:
-        path_parts = [part for part in urlparse(url).path.split("/") if part]
+        parsed = urlparse(url)
+        query_job_id = parse_qs(parsed.query).get("currentJobId", [None])[0]
+        if query_job_id:
+            return query_job_id
+
+        path_parts = [part for part in parsed.path.split("/") if part]
         try:
             view_index = path_parts.index("view")
         except ValueError:

@@ -92,7 +92,7 @@ Most important values:
 - `BACKEND_PORT`: host port mapped to the backend container
 - `FRONTEND_PORT`: host port mapped to nginx
 - `JOB_ASSIST_CORS_ALLOWED_ORIGINS`: comma-separated allowed UI origins
-- `JOB_ASSIST_CORS_ALLOWED_ORIGIN_REGEX`: allowed regex for extension origins
+- `JOB_ASSIST_CORS_ALLOWED_ORIGIN_REGEX`: allowed regex for Chrome and Firefox extension origins
 - `JOB_ASSIST_DB_PATH`: SQLite path when not using Docker
 - `COMPATIBILITY_PROVIDER`: `deterministic`, `openrouter`, or `opencode`
 - `OPENROUTER_API_KEY`: API key if you use an OpenRouter-backed provider
@@ -106,7 +106,7 @@ BACKEND_HOST=127.0.0.1
 BACKEND_PORT=8000
 FRONTEND_PORT=8080
 JOB_ASSIST_CORS_ALLOWED_ORIGINS=http://127.0.0.1:8000,http://localhost:8000,http://127.0.0.1:8080,http://localhost:8080
-JOB_ASSIST_CORS_ALLOWED_ORIGIN_REGEX=chrome-extension://.*
+JOB_ASSIST_CORS_ALLOWED_ORIGIN_REGEX='^(chrome-extension|moz-extension):\/\/.*$'
 JOB_ASSIST_DB_PATH=data/job_assist.db
 
 COMPATIBILITY_PROVIDER=deterministic

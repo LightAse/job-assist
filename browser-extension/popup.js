@@ -234,6 +234,15 @@ async function buildDiagnosticReport(reason, error = null) {
 function downloadJsonFile(filename, data) {
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
+  if (!url || /^chrome-extension:\/\/invalid(?:\/|$)/i.test(url)) {
+    console.warn("[Job Assist][Popup]", "Refusing to download diagnostics because the generated URL is invalid.", {
+      filename,
+      url,
+      runtimeId: chrome.runtime?.id || null,
+    });
+    return;
+  }
+
   const anchor = document.createElement("a");
   anchor.href = url;
   anchor.download = filename;
@@ -553,6 +562,14 @@ function getBatchJobKey(job) {
   return job.linkedinJobId || job.fallbackKey || job.title || null;
 }
 
+function isLinkedInRailUnavailableError(error) {
+  const message = error instanceof Error ? error.message : String(error || "");
+  return (
+    message.includes("Could not find the LinkedIn jobs rail") ||
+    message.includes("Open a LinkedIn jobs listing with the visible jobs rail")
+  );
+}
+
 async function captureVisibleJobs() {
   const tab = await getActiveTab();
   if (!tab || !tab.id || !tab.url) {
@@ -567,6 +584,7 @@ async function captureVisibleJobs() {
     failed: 0,
     scrolls: 0,
     errors: [],
+    stoppedEarlyReason: null,
   };
   const processedKeys = new Set();
   const discoveredKeys = new Set();
@@ -652,44 +670,97 @@ async function captureVisibleJobs() {
         await submitCapture(payload);
         progress.created += 1;
       } catch (error) {
-        lastDiagnosticError = error;
-        recordDiagnostic("error", "Visible-job capture failed.", {
-          batchKey: job.batchKey,
-          title: job.title || null,
-          linkedinJobId: job.linkedinJobId || null,
-          error,
-        });
-        console.error("[Job Assist][Popup] Visible-job capture failed.", {
-          batchKey: job.batchKey,
-          title: job.title || null,
-          linkedinJobId: job.linkedinJobId || null,
-          error,
-        });
-        progress.errors.push({
-          batchKey: job.batchKey,
-          title: job.title || null,
-          linkedinJobId: job.linkedinJobId || null,
-          error: serializeError(error),
-        });
-        progress.failed += 1;
+        let recovered = false;
+        try {
+          const currentExtraction = await extractFromTab(tab.id);
+          const currentJobMatches =
+            !job.linkedinJobId || currentExtraction.linkedinJobId === job.linkedinJobId;
+          if (currentJobMatches) {
+            const payload = buildPayload(tab, currentExtraction);
+            await submitCapture(payload);
+            progress.created += 1;
+            progress.stoppedEarlyReason =
+              "LinkedIn opened the selected job as a full page, so bulk capture saved that job and stopped.";
+            recovered = true;
+          }
+        } catch (recoveryError) {
+          recordDiagnostic("error", "Visible-job full-page recovery failed.", {
+            batchKey: job.batchKey,
+            title: job.title || null,
+            linkedinJobId: job.linkedinJobId || null,
+            originalError: error,
+            recoveryError,
+          });
+        }
+
+        if (!recovered) {
+          lastDiagnosticError = error;
+          recordDiagnostic("error", "Visible-job capture failed.", {
+            batchKey: job.batchKey,
+            title: job.title || null,
+            linkedinJobId: job.linkedinJobId || null,
+            error,
+          });
+          console.error("[Job Assist][Popup] Visible-job capture failed.", {
+            batchKey: job.batchKey,
+            title: job.title || null,
+            linkedinJobId: job.linkedinJobId || null,
+            error,
+          });
+          progress.errors.push({
+            batchKey: job.batchKey,
+            title: job.title || null,
+            linkedinJobId: job.linkedinJobId || null,
+            error: serializeError(error),
+          });
+          progress.failed += 1;
+        }
       } finally {
         processedKeys.add(job.batchKey);
         progress.processed += 1;
         setStatus(formatBatchStatus(progress));
       }
+
+      if (progress.stoppedEarlyReason) {
+        break;
+      }
     }
 
-    const scrollState = await scrollLinkedInJobRail(tab.id);
+    if (progress.stoppedEarlyReason) {
+      break;
+    }
+
+    let scrollState = null;
+    try {
+      scrollState = await scrollLinkedInJobRail(tab.id);
+    } catch (error) {
+      if (progress.created > 0 && isLinkedInRailUnavailableError(error)) {
+        progress.stoppedEarlyReason =
+          "LinkedIn left the search results page, so bulk capture stopped after saving the jobs already captured.";
+        break;
+      }
+      throw error;
+    }
     progress.scrolls += 1;
     setStatus(`${formatBatchStatus(progress)}\n\nScrolling...`);
 
-    const afterScrollJobs = await listVisibleLinkedInJobsWithRetry(tab.id, {
-      railRetryDelaysMs: postScrollRailRetryDelaysMs,
-      renderRetryDelaysMs: postScrollRenderRetryDelaysMs,
-      railStatusMessage: `${formatBatchStatus(progress)}\n\nWaiting for LinkedIn jobs rail to reappear…`,
-      renderStatusMessage: `${formatBatchStatus(progress)}\n\nWaiting for jobs to render…`,
-      allowEmpty: true,
-    });
+    let afterScrollJobs = [];
+    try {
+      afterScrollJobs = await listVisibleLinkedInJobsWithRetry(tab.id, {
+        railRetryDelaysMs: postScrollRailRetryDelaysMs,
+        renderRetryDelaysMs: postScrollRenderRetryDelaysMs,
+        railStatusMessage: `${formatBatchStatus(progress)}\n\nWaiting for LinkedIn jobs rail to reappear…`,
+        renderStatusMessage: `${formatBatchStatus(progress)}\n\nWaiting for jobs to render…`,
+        allowEmpty: true,
+      });
+    } catch (error) {
+      if (progress.created > 0 && isLinkedInRailUnavailableError(error)) {
+        progress.stoppedEarlyReason =
+          "LinkedIn left the search results page, so bulk capture stopped after saving the jobs already captured.";
+        break;
+      }
+      throw error;
+    }
     let foundNewAfterScroll = false;
     for (const job of afterScrollJobs) {
       const batchKey = getBatchJobKey(job);
@@ -764,7 +835,8 @@ captureVisibleButton.addEventListener("click", async () => {
         `Created: ${summary.created}`,
         `Skipped duplicates: ${summary.skippedDuplicates}`,
         `Failed: ${summary.failed}`,
-      ].join("\n"),
+        summary.stoppedEarlyReason ? `Stopped early: ${summary.stoppedEarlyReason}` : null,
+      ].filter(Boolean).join("\n"),
       summary.failed ? "error" : "success"
     );
   } catch (error) {
